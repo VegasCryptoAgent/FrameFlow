@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+@theme {
+  --color-neon: #00FF00;
+  --color-brutal: #141414;
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-display: 'Inter', system-ui, sans-serif;
+}
+
+@layer base {
+  .markdown-content {
+    @apply font-sans leading-relaxed text-white/80;
+  }
+  
+  .markdown-content p {
+    @apply mb-4;
+  }
+  
+  .markdown-content strong {
+    @apply font-black text-neon uppercase tracking-[0.2em] text-[10px] block mt-10 mb-4 first:mt-0;
+  }
+  
+  .markdown-content ul {
+    @apply list-none space-y-3 mb-8;
+  }
+  
+  .markdown-content li {
+    @apply pl-6 relative text-sm text-white/70 before:content-[''] before:absolute before:left-0 before:top-2.5 before:w-2 before:h-[1px] before:bg-neon/30;
+  }
+  
+  .markdown-content em {
+    @apply text-white/40 italic;
+  }
+
+  body {
+    @apply bg-[#050505] text-white selection:bg-neon selection:text-black;
+  }
+}
+
+@layer components {
+  .brutal-border {
+    @apply border border-white/20 hover:border-neon transition-colors duration-300;
+  }
+  
+  .glass-card {
+    @apply bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl;
+  }
+
+  .neon-glow {
+    text-shadow: 0 0 10px rgba(0, 255, 0, 0.5);
+  }
+}
+
+@layer utilities {
+  @keyframes scanline {
+    0% { transform: translateY(0); }
+    100% { transform: translateY(10%); }
+  }
+
+  @keyframes scan {
+    from { background-position: 0 0; }
+    to { background-position: 0 100%; }
+  }
+}
+
+.animate-scanline {
+  animation: scanline 20s linear infinite;
+}

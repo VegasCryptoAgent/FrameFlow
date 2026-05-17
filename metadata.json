@@ -1,0 +1,6 @@
+{
+  "name": "FrameFlow - Video to Prompt Analyzer",
+  "description": "Upload a video to extract keyframes and generate detailed AI prompts for each frame, allowing you to recreate or remix video styles using generative AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
