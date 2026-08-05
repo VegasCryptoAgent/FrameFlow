@@ -38,8 +38,9 @@ import {
   upscaleImage,
   generateRemixPrompt,
   generateRemixStoryScript,
-  refineRemix
-} from './services/geminiService';
+  refineRemix,
+  checkXaiConfiguration
+} from './services/xaiService';
 import { FrameData, AnalysisStatus, AppSettings } from './types';
 
 // Simple ID generator
@@ -126,7 +127,7 @@ const App: React.FC = () => {
   // Settings
   const [settings, setSettings] = useState<AppSettings>({
     samplingInterval: 3, // Default 3 seconds
-    geminiModel: 'gemini-3-flash-preview',
+    xaiModel: 'grok-4.5',
     customInstructions: '',
     promptTemplate: '{{PROMPT}}' // Default template
   });
@@ -142,19 +143,15 @@ const App: React.FC = () => {
 
   // Handlers
   const ensureApiKey = async (): Promise<boolean> => {
-    // @ts-ignore - aistudio is injected by the environment
-    if (window.aistudio && typeof window.aistudio.hasSelectedApiKey === 'function') {
-      // @ts-ignore
-      const hasKey = await window.aistudio.hasSelectedApiKey();
-      if (!hasKey) {
-          // @ts-ignore
-          await window.aistudio.openSelectKey();
-          return true;
-      }
+    try {
+      await checkXaiConfiguration();
       return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'xAI is not configured.';
+      setGlobalError(message);
+      alert(message);
+      return false;
     }
-    // Fallback if environment doesn't have the key selector (local dev mostly)
-    return true; 
   };
 
   // Handlers
@@ -205,7 +202,7 @@ const App: React.FC = () => {
     if (!videoUrl) return;
 
     // Ensure we have an API key if needed
-    await ensureApiKey();
+    if (!(await ensureApiKey())) return;
 
     setStatus(AnalysisStatus.EXTRACTING);
     setProgress(0);
@@ -252,7 +249,7 @@ const App: React.FC = () => {
             const { prompt, metadata } = await generateFramePrompt(frame.imageUrl, {
               customInstructions: settings.customInstructions,
               template: settings.promptTemplate,
-              model: settings.geminiModel
+              model: settings.xaiModel
             });
             setFrames(prev => prev.map(f => 
               f.id === frame.id 
@@ -293,7 +290,7 @@ const App: React.FC = () => {
     const frame = frames.find(f => f.id === frameId);
     if (!frame) return;
 
-    await ensureApiKey();
+    if (!(await ensureApiKey())) return;
 
     setFrames(prev => prev.map(f => f.id === frameId ? { ...f, isAnalyzing: true, error: undefined } : f));
 
@@ -301,7 +298,7 @@ const App: React.FC = () => {
       const { prompt, metadata } = await generateFramePrompt(frame.imageUrl, {
         customInstructions: settings.customInstructions,
         template: settings.promptTemplate,
-        model: settings.geminiModel
+        model: settings.xaiModel
       });
       setFrames(prev => prev.map(f => 
         f.id === frameId 
@@ -389,7 +386,7 @@ const App: React.FC = () => {
     }
   };
 
-  const handleUpscaleImage = async (frameId: string, size: "2K" | "4K" = "2K") => {
+  const handleUpscaleImage = async (frameId: string, size: "2K" = "2K") => {
     const frame = frames.find(f => f.id === frameId);
     if (!frame || !frame.prompt) return;
 
@@ -457,11 +454,11 @@ const App: React.FC = () => {
 
     if (validPrompts.length === 0) return;
 
-    await ensureApiKey();
+    if (!(await ensureApiKey())) return;
 
     setIsGeneratingScript(true);
     try {
-        const script = await generateStoryScript(validPrompts);
+        const script = await generateStoryScript(validPrompts, settings.xaiModel);
         setStoryScript(script);
         setIsStoryboardMode(true);
     } catch (e) {
@@ -484,13 +481,13 @@ const App: React.FC = () => {
       return;
     }
 
-    await ensureApiKey();
+    if (!(await ensureApiKey())) return;
 
     setIsRemixing(true);
     setProgress(0);
 
     try {
-      let scriptData: { mimeType: string, data: string } | undefined;
+      let scriptData: { mimeType: string; data: string; filename: string } | undefined;
       
       if (remixScriptFile) {
         const base64 = await new Promise<string>((resolve, reject) => {
@@ -501,7 +498,8 @@ const App: React.FC = () => {
         });
         scriptData = {
           mimeType: remixScriptFile.type,
-          data: base64
+          data: base64,
+          filename: remixScriptFile.name
         };
       }
 
@@ -518,7 +516,7 @@ const App: React.FC = () => {
 
       // 1. Generate Remixed Narrative Script (always do this for context)
       const allOriginalPrompts = frames.filter(f => f.prompt).map(f => f.prompt as string);
-      const newScript = await generateRemixStoryScript(allOriginalPrompts, remixIdea, scriptData);
+      const newScript = await generateRemixStoryScript(allOriginalPrompts, remixIdea, scriptData, settings.xaiModel);
       setRemixStoryScript(newScript);
 
       // 2. Generate Remixed Frame Prompts
@@ -535,7 +533,7 @@ const App: React.FC = () => {
             const remixPrompt = await generateRemixPrompt(frame.prompt, remixIdea, scriptData, {
               customInstructions: settings.customInstructions,
               template: settings.promptTemplate,
-              model: settings.geminiModel,
+              model: settings.xaiModel,
               storyContext: newScript
             });
             remixedFramesMap[frame.id] = remixPrompt;
@@ -577,6 +575,7 @@ const App: React.FC = () => {
 
   const handleRefineRemix = async (feedback: string) => {
     if (!remixStoryScript) return;
+    if (!(await ensureApiKey())) return;
     
     setIsRefining(true);
     setRemixChatHistory(prev => [...prev, { role: 'user', content: feedback }]);
@@ -592,7 +591,7 @@ const App: React.FC = () => {
         remixStoryScript,
         feedback,
         refinementData,
-        { history: remixChatHistory }
+        { history: remixChatHistory, model: settings.xaiModel }
       );
 
       setRemixStoryScript(result.refinedScript);
@@ -820,6 +819,7 @@ const App: React.FC = () => {
     // FIX: Explicitly type idsToProcess as string[] and use spread operator for reliable inference from Set
     const idsToProcess: string[] = [...selectedFrameIds];
     if (idsToProcess.length === 0) return;
+    if (!(await ensureApiKey())) return;
 
     setFrames(prev => prev.map(f => 
       idsToProcess.includes(f.id) 
@@ -837,7 +837,8 @@ const App: React.FC = () => {
           try {
               const { prompt, metadata } = await generateFramePrompt(frame.imageUrl, {
                 customInstructions: settings.customInstructions,
-                template: settings.promptTemplate
+                template: settings.promptTemplate,
+                model: settings.xaiModel
               });
                setFrames(prev => prev.map(f => 
                 f.id === frame.id 
@@ -1037,11 +1038,27 @@ const App: React.FC = () => {
                             onChange={(e) => setSettings({...settings, customInstructions: e.target.value})}
                           />
                         </div>
+
+                        <div className="space-y-4">
+                          <label className="text-[10px] font-bold text-neon uppercase tracking-widest flex items-center gap-2">
+                             03. Grok Vision / Text Model
+                          </label>
+                          <input
+                            type="text"
+                            className="w-full bg-transparent border border-white/10 p-4 text-sm text-white/80 focus:border-neon outline-none font-mono"
+                            value={settings.xaiModel}
+                            onChange={(e) => setSettings({ ...settings, xaiModel: e.target.value })}
+                            placeholder="grok-4.5"
+                          />
+                          <p className="text-[9px] text-white/30 font-mono uppercase tracking-wider">
+                            Must support image understanding for frame analysis
+                          </p>
+                        </div>
                       </div>
 
                         <div className="space-y-4">
                           <label className="text-[10px] font-bold text-neon uppercase tracking-widest flex items-center gap-2">
-                             03. Prompt Template Engine
+                             04. Prompt Template Engine
                           </label>
                           <div className="border border-white/10 bg-black/40 relative">
                             <div className="flex flex-wrap gap-2 p-3 border-b border-white/10">
