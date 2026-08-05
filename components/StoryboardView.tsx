@@ -61,85 +61,49 @@ const StoryboardView: React.FC<StoryboardViewProps> = ({
     window.print();
   };
 
-  const handleExportPDF = () => {
-    if (!contentRef.current) return;
-    
+  const handleExportPDF = async () => {
     setIsExporting(true);
-
-    setTimeout(() => {
-        const element = contentRef.current;
-        const opt = {
-            margin: [0.3, 0.3],
-            filename: 'ff-storyboard.pdf',
-            image: { type: 'jpeg', quality: 0.98 },
-            html2canvas: { 
-                scale: 2, 
-                useCORS: true, 
-                scrollY: 0,
-                onclone: (clonedDoc: Document) => {
-                    // html2canvas 1.x doesn't support modern color functions like oklab/oklch used by Tailwind v4
-                    // We inject a style override to force standard colors for the export
-                    const style = clonedDoc.createElement('style');
-                    style.innerHTML = `
-                        /* Global reset for modern color space features that crash html2canvas */
-                        * {
-                            color-interpolation-filters: sRGB !important;
-                        }
-                        
-                        /* Force standard color overrides for elements during export */
-                        .bg-white { background-color: #ffffff !important; }
-                        .text-black { color: #000000 !important; }
-                        .bg-black { background-color: #000000 !important; }
-                        .text-white { color: #ffffff !important; }
-                        .text-neon { color: #00ff00 !important; }
-                        .bg-neon { background-color: #00ff00 !important; }
-                        
-                        /* Sanitize any modern color functions in existing style tags */
-                        /* (This still works for dev mode style tags) */
-                    `;
-                    clonedDoc.head.appendChild(style);
-
-                    const styles = clonedDoc.getElementsByTagName('style');
-                    for (let i = 0; i < styles.length; i++) {
-                        let css = styles[i].innerHTML;
-                        if (css.includes('oklch') || css.includes('oklab') || css.includes('color-mix')) {
-                            css = css.replace(/(oklch|oklab|color-mix)\((?:[^)(]+|\((?:[^)(]+|\([^)(]*\))*\))*\)/g, '#888888');
-                            styles[i].innerHTML = css;
-                        }
-                    }
-
-                    // Handle inline styles
-                    const elementsWithStyle = clonedDoc.querySelectorAll('[style]');
-                    elementsWithStyle.forEach(el => {
-                        let style = el.getAttribute('style') || '';
-                        if (style.includes('oklch') || style.includes('oklab') || style.includes('color-mix')) {
-                            style = style.replace(/(oklch|oklab|color-mix)\((?:[^)(]+|\((?:[^)(]+|\([^)(]*\))*\))*\)/g, '#888888');
-                            el.setAttribute('style', style);
-                        }
-                    });
-
-                    // Force specific elements to be readable if they rely on problematic classes
-                    const narrative = clonedDoc.querySelector('.font-syne');
-                    if (narrative) (narrative as HTMLElement).style.color = '#000000';
-                }
-            },
-            jsPDF: { unit: 'in', format: 'a4', orientation: 'portrait' }
-        };
-
-        // @ts-ignore
-        if (window.html2pdf) {
-            // @ts-ignore
-            window.html2pdf().set(opt).from(element).save().then(() => {
-                setIsExporting(false);
-            }).catch((err: any) => {
-                console.error("PDF Export failed", err);
-                setIsExporting(false);
-            });
-        } else {
-            setIsExporting(false);
-            alert("Library not found. Try Printing.");
-        }
-    }, 100);
+    try {
+      const isRemix = viewMode === 'remix';
+      const response = await fetch('/api/storyboard-pdf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: viewMode,
+          narrative: isRemix ? (remixScript || script) : script,
+          frames: sortedFrames.map(frame => ({
+            timestamp: frame.timestamp,
+            image: isRemix
+              ? (frame.remixImage || frame.imageUrl)
+              : (frame.generatedImage || frame.imageUrl),
+            prompt: viewMode === 'comparison'
+              ? `NATIVE: ${frame.prompt || ''}\n\nREMIX: ${frame.remixPrompt || ''}`
+              : (isRemix ? (frame.remixPrompt || frame.prompt) : frame.prompt),
+            shotType: frame.metadata?.shotType,
+            cameraAngle: frame.metadata?.cameraAngle,
+            lighting: frame.metadata?.lighting,
+          })),
+        }),
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: 'PDF export failed.' }));
+        throw new Error(error.error || 'PDF export failed.');
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `frameflow-${viewMode}-storyboard.pdf`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      console.error('PDF export failed:', error);
+      alert(error instanceof Error ? error.message : 'PDF export failed.');
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   const formatTime = (seconds: number) => {
@@ -199,7 +163,7 @@ const StoryboardView: React.FC<StoryboardViewProps> = ({
               className="px-6 py-2 bg-black border border-white text-[9px] font-black uppercase tracking-widest hover:bg-white hover:text-black transition-all flex items-center gap-2"
             >
               {isExporting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Layers className="w-3 h-3" />}
-              Export Asset
+              Export PDF
             </button>
             <button 
               onClick={handlePrint}

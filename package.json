@@ -10,7 +10,6 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@distube/ytdl-core": "^4.16.12",
     "@tailwindcss/vite": "^4.3.0",
     "axios": "^1.16.1",
     "cors": "^2.8.6",
@@ -18,6 +17,7 @@
     "framer-motion": "^12.38.0",
     "lucide-react": "^0.556.0",
     "motion": "^12.38.0",
+    "pdfkit": "^0.19.1",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
     "react-markdown": "^10.1.0",
@@ -26,6 +26,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
+    "@types/pdfkit": "^0.17.6",
     "@vitejs/plugin-react": "^5.0.0",
     "esbuild": "^0.28.0",
     "tsx": "^4.22.0",

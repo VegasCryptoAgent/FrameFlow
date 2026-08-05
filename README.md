@@ -55,7 +55,7 @@ Production serves the built app and API from port `3000`. Set `XAI_API_KEY` in t
 
 ### Railway
 
-The included `railway.json` configures the production build, start command, health check, and restart policy. Create a Railway service from this repository and set `XAI_API_KEY`, `XAI_TEXT_MODEL`, and `XAI_IMAGE_MODEL` as service variables. Railway supplies the runtime `PORT` automatically.
+The included `railway.json` and `Dockerfile` configure the production build, current `yt-dlp` YouTube resolver, start command, health check, and restart policy. Create a Railway service from this repository and set `XAI_API_KEY`, `XAI_TEXT_MODEL`, and `XAI_IMAGE_MODEL` as service variables. Railway supplies the runtime `PORT` automatically.
 
 ## Notes
 

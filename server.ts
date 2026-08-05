@@ -2,10 +2,58 @@ import express from "express";
 import path from "path";
 import cors from "cors";
 import { createServer as createViteServer, loadEnv } from "vite";
-import ytdl from "@distube/ytdl-core";
 import axios from "axios";
+import PDFDocument from "pdfkit";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 const XAI_API_BASE_URL = 'https://api.x.ai/v1';
+const execFileAsync = promisify(execFile);
+
+const isYouTubeUrl = (value: string): boolean => {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase().replace(/^www\./, '');
+    return hostname === 'youtube.com' || hostname.endsWith('.youtube.com') || hostname === 'youtu.be';
+  } catch {
+    return false;
+  }
+};
+
+const resolveYouTubeUrl = async (videoUrl: string): Promise<string> => {
+  const format = 'best[ext=mp4][vcodec^=avc1][acodec!=none]/best[ext=mp4][acodec!=none]/best';
+  const { stdout } = await execFileAsync('yt-dlp', [
+    '--no-playlist',
+    '--no-warnings',
+    '--js-runtimes', 'node',
+    '--remote-components', 'ejs:github',
+    '--format', format,
+    '--get-url',
+    videoUrl,
+  ], {
+    timeout: 120000,
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  const resolved = stdout.split(/\r?\n/).map(line => line.trim()).find(Boolean);
+  if (!resolved || !resolved.startsWith('http')) throw new Error('YouTube did not return a browser-compatible video stream.');
+  return resolved;
+};
+
+const cleanPdfText = (value: unknown): string => String(value || '')
+  .replace(/```[\s\S]*?```/g, block => block.replace(/```\w*/g, ''))
+  .replace(/^#{1,6}\s*/gm, '')
+  .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+  .replace(/\*\*|__|\*|_/g, '')
+  .replace(/[\u2010-\u2015]/g, '-')
+  .replace(/^[•*-]\s+/gm, '- ')
+  .trim();
+
+const imageBufferFromDataUrl = (value: unknown): Buffer | null => {
+  if (typeof value !== 'string') return null;
+  const match = value.match(/^data:image\/(?:jpeg|jpg|png|webp);base64,(.+)$/i);
+  if (!match) return null;
+  const buffer = Buffer.from(match[1], 'base64');
+  return buffer.length <= 20 * 1024 * 1024 ? buffer : null;
+};
 
 interface InlineFile {
   filename: string;
@@ -214,6 +262,108 @@ async function startServer() {
     }
   });
 
+  app.post('/api/storyboard-pdf', (req, res) => {
+    const { narrative, mode = 'original', frames = [] } = req.body || {};
+    const modeLabel = ['original', 'remix', 'comparison'].includes(mode) ? mode : 'original';
+    if (typeof narrative !== 'string' || !Array.isArray(frames)) {
+      return res.status(400).json({ error: 'A narrative and frame list are required.' });
+    }
+    if (frames.length > 120) {
+      return res.status(400).json({ error: 'Storyboard export is limited to 120 frames.' });
+    }
+
+    try {
+      const doc = new PDFDocument({
+        size: 'A4',
+        margins: { top: 44, right: 44, bottom: 52, left: 44 },
+        bufferPages: true,
+        info: {
+          Title: 'FrameFlow Storyboard',
+          Author: 'FrameFlow',
+          Subject: `${modeLabel} storyboard export`,
+        },
+      });
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="frameflow-${modeLabel}-storyboard.pdf"`);
+      doc.pipe(res);
+
+      const pageWidth = doc.page.width;
+      const contentWidth = pageWidth - doc.page.margins.left - doc.page.margins.right;
+      const neon = '#19f55a';
+      const ink = '#111111';
+      const muted = '#5f6368';
+
+      doc.rect(0, 0, pageWidth, 116).fill(ink);
+      doc.fillColor(neon).font('Helvetica-Bold').fontSize(28).text('FRAMEFLOW', 44, 42, { characterSpacing: 1.5 });
+      doc.fillColor('#ffffff').font('Helvetica').fontSize(10).text(`${modeLabel.toUpperCase()} STORYBOARD`, 44, 82, { characterSpacing: 2 });
+      doc.fillColor(ink).font('Helvetica-Bold').fontSize(18).text('Narrative', 44, 148);
+      doc.moveTo(44, 176).lineTo(44 + contentWidth, 176).strokeColor(neon).lineWidth(2).stroke();
+      doc.moveDown(1.2);
+      doc.fillColor(muted).font('Helvetica').fontSize(10.5).text(cleanPdfText(narrative), 44, 194, {
+        width: contentWidth,
+        lineGap: 3,
+      });
+
+      frames.forEach((frame: any, index: number) => {
+        doc.addPage();
+        const timestamp = Number(frame?.timestamp) || 0;
+        const mins = Math.floor(timestamp / 60);
+        const secs = Math.floor(timestamp % 60).toString().padStart(2, '0');
+
+        doc.fillColor(ink).font('Helvetica-Bold').fontSize(24).text(`SHOT ${(index + 1).toString().padStart(2, '0')}`, 44, 42);
+        doc.fillColor(neon).font('Helvetica-Bold').fontSize(11).text(`${mins}:${secs}`, pageWidth - 100, 48, { width: 56, align: 'right' });
+        doc.moveTo(44, 76).lineTo(44 + contentWidth, 76).strokeColor(neon).lineWidth(2).stroke();
+
+        const image = imageBufferFromDataUrl(frame?.image);
+        if (image) {
+          doc.rect(44, 98, contentWidth, 292).fillAndStroke('#f1f3f4', '#d4d7da');
+          try {
+            doc.image(image, 50, 104, { fit: [contentWidth - 12, 280], align: 'center', valign: 'center' });
+          } catch {
+            doc.fillColor(muted).font('Helvetica').fontSize(10).text('Frame image could not be rendered.', 44, 230, { width: contentWidth, align: 'center' });
+          }
+        } else {
+          doc.rect(44, 98, contentWidth, 180).fillAndStroke('#f1f3f4', '#d4d7da');
+          doc.fillColor(muted).font('Helvetica').fontSize(10).text('No frame image available.', 44, 180, { width: contentWidth, align: 'center' });
+        }
+
+        const promptTop = image ? 416 : 304;
+        doc.fillColor(ink).font('Helvetica-Bold').fontSize(12).text('GENERATION PROMPT', 44, promptTop, { characterSpacing: 1 });
+        doc.fillColor(muted).font('Helvetica').fontSize(10).text(cleanPdfText(frame?.prompt || 'No prompt available.'), 44, promptTop + 26, {
+          width: contentWidth,
+          lineGap: 3,
+        });
+
+        const metadata = [frame?.shotType, frame?.cameraAngle, frame?.lighting].filter(Boolean).map(cleanPdfText);
+        if (metadata.length) {
+          doc.fillColor(neon).font('Helvetica-Bold').fontSize(8.5).text(metadata.join('  /  ').toUpperCase(), 44, 746, {
+            width: contentWidth,
+            align: 'left',
+          });
+        }
+      });
+
+      const range = doc.bufferedPageRange();
+      for (let pageIndex = range.start; pageIndex < range.start + range.count; pageIndex++) {
+        doc.switchToPage(pageIndex);
+        const originalBottomMargin = doc.page.margins.bottom;
+        doc.page.margins.bottom = 10;
+        doc.fillColor('#8a8d91').font('Helvetica').fontSize(8).text(
+          `FRAMEFLOW  /  ${pageIndex + 1} OF ${range.count}`,
+          44,
+          doc.page.height - 32,
+          { width: contentWidth, align: 'right', lineBreak: false },
+        );
+        doc.page.margins.bottom = originalBottomMargin;
+      }
+      doc.end();
+    } catch (error: any) {
+      console.error('Storyboard PDF error:', error.message);
+      if (!res.headersSent) res.status(500).json({ error: 'Could not generate storyboard PDF.' });
+      else res.end();
+    }
+  });
+
   // Proxy route for videos to bypass CORS and resolve YouTube/Vimeo
   app.get("/api/video-proxy", async (req, res) => {
     const videoUrl = req.query.url as string;
@@ -226,18 +376,10 @@ async function startServer() {
     try {
       let targetUrl = videoUrl;
 
-      // Handle YouTube
-      if (ytdl.validateURL(videoUrl)) {
-        const info = await ytdl.getInfo(videoUrl);
-        const format = ytdl.chooseFormat(info.formats, { 
-          quality: 'highestvideo',
-          filter: format => format.container === 'mp4' && !!format.url
-        });
-
-        if (!format || !format.url) {
-          return res.status(404).send("Could not find a suitable MP4 format for this YouTube video.");
-        }
-        targetUrl = format.url;
+      // Resolve a fresh progressive MP4 with yt-dlp. YouTube now rejects the
+      // archived ytdl-core resolver with 403s on many hosted environments.
+      if (isYouTubeUrl(videoUrl)) {
+        targetUrl = await resolveYouTubeUrl(videoUrl);
       }
 
       // Handle Vimeo
@@ -267,7 +409,7 @@ async function startServer() {
           url: targetUrl,
           responseType: 'stream',
           headers: proxyHeaders,
-          timeout: 20000
+          timeout: 60000
       });
 
       const contentType = String(response.headers['content-type'] || 'video/mp4');
@@ -287,8 +429,9 @@ async function startServer() {
       response.data.pipe(res);
 
     } catch (error: any) {
-      console.error("Proxy error:", error.message);
-      res.status(500).send(`Failed to proxy video: ${error.message}`);
+      const detail = error.stderr?.trim() || error.response?.data?.toString?.() || error.message;
+      console.error("Proxy error:", detail);
+      res.status(502).send(`Failed to resolve or stream this video. ${detail}`);
     }
   });
 
