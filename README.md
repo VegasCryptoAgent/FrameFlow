@@ -53,6 +53,10 @@ npm start
 
 Production serves the built app and API from port `3000`. Set `XAI_API_KEY` in the deployment environment; `.env.local` is ignored by Git.
 
+### Railway
+
+The included `railway.json` configures the production build, start command, health check, and restart policy. Create a Railway service from this repository and set `XAI_API_KEY`, `XAI_TEXT_MODEL`, and `XAI_IMAGE_MODEL` as service variables. Railway supplies the runtime `PORT` automatically.
+
 ## Notes
 
 - Grok Imagine currently supports native 1K and 2K output. The app therefore exposes 2K for AI enhancement.

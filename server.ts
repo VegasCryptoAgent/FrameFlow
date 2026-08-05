@@ -15,7 +15,7 @@ interface InlineFile {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   // Vite-style env loading keeps .env.local working for the custom Express server.
   const env = loadEnv(process.env.NODE_ENV || 'development', process.cwd(), '');
