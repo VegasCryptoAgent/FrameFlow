@@ -10,7 +10,7 @@ interface FrameCardProps {
   isSelected: boolean;
   onToggleSelect: (frameId: string) => void;
   onGenerateImage: (frameId: string, referenceImageUrl?: string) => void;
-  onUpscaleImage: (frameId: string, size: "2K" | "4K") => void;
+  onUpscaleImage: (frameId: string, size: "2K") => void;
   onUpdatePrompt: (frameId: string, newPrompt: string) => void;
 }
 
@@ -344,7 +344,7 @@ const FrameCard: React.FC<FrameCardProps> = ({
                               <Sparkles className="w-3 h-3 text-black" />
                             </div>
                             <div className="p-1 space-y-1">
-                              {(['2K', '4K'] as const).map((q) => (
+                              {(['2K'] as const).map((q) => (
                                 <button
                                   key={q}
                                   onClick={() => {
@@ -355,7 +355,7 @@ const FrameCard: React.FC<FrameCardProps> = ({
                                 >
                                   <div className="flex flex-col">
                                     <span className="text-[10px] font-black uppercase tracking-widest">{q} Enhancement</span>
-                                    <span className="text-[8px] opacity-50 uppercase">{q === '4K' ? 'Ultra HD Resolve' : 'High Def Resolve'}</span>
+                                    <span className="text-[8px] opacity-50 uppercase">Grok Imagine enhancement</span>
                                   </div>
                                   <ChevronRight className="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity" />
                                 </button>

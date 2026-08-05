@@ -1,37 +1,53 @@
 import express from "express";
 import path from "path";
 import cors from "cors";
-import { createServer as createViteServer } from "vite";
+import { createServer as createViteServer, loadEnv } from "vite";
 import ytdl from "@distube/ytdl-core";
 import axios from "axios";
-import { GoogleGenAI } from "@google/genai";
+
+const XAI_API_BASE_URL = 'https://api.x.ai/v1';
+
+interface InlineFile {
+  filename: string;
+  mimeType: string;
+  data: string;
+}
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
+  // Vite-style env loading keeps .env.local working for the custom Express server.
+  const env = loadEnv(process.env.NODE_ENV || 'development', process.cwd(), '');
+  for (const [key, value] of Object.entries(env)) {
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+
   app.use(cors());
   app.use(express.json({ limit: '50mb' }));
 
-  // Initialize Gemini
-  const getGeminiClient = () => {
-    const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+  const getXaiApiKey = () => {
+    const apiKey = process.env.XAI_API_KEY;
     if (!apiKey) {
-      throw new Error('GEMINI_API_KEY is not set in the server environment');
+      throw new Error('XAI_API_KEY is not set in the server environment. Add it to .env.local and restart FrameFlow.');
     }
-    return new GoogleGenAI({ 
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        }
-      }
-    });
+    return apiKey;
   };
+
+  const xaiHeaders = () => ({
+    Authorization: `Bearer ${getXaiApiKey()}`,
+    'Content-Type': 'application/json',
+  });
 
   // API Routes
   app.get("/api/health", (req, res) => {
-    res.json({ status: "ok" });
+    res.json({
+      status: "ok",
+      provider: "xAI",
+      configured: Boolean(process.env.XAI_API_KEY),
+      textModel: process.env.XAI_TEXT_MODEL || 'grok-4.5',
+      imageModel: process.env.XAI_IMAGE_MODEL || 'grok-imagine-image-quality',
+    });
   });
 
   // Helper for retries with jitter and more attempts for rate limits
@@ -41,15 +57,16 @@ async function startServer() {
       try {
         return await fn();
       } catch (error: any) {
-        const isRateLimit = error.message?.includes('429') || error.status === 429;
-        const isRetryable = isRateLimit || error.status === 503 || error.status === 504;
+        const status = error.response?.status || error.status;
+        const isRateLimit = error.message?.includes('429') || status === 429;
+        const isRetryable = isRateLimit || status === 408 || status === 500 || status === 502 || status === 503 || status === 504;
         
         if (i < retries - 1 && isRetryable) {
           // Add jitter to avoid thundering herd
           const jitter = Math.random() * 1000;
           const waitTime = currentDelay + jitter;
           
-          console.log(`[RETRY ${i + 1}/${retries}] Error ${error.status || 'Unknown'}, retrying in ${Math.round(waitTime)}ms...`);
+          console.log(`[RETRY ${i + 1}/${retries}] xAI error ${status || 'Unknown'}, retrying in ${Math.round(waitTime)}ms...`);
           
           await new Promise(resolve => setTimeout(resolve, waitTime));
           currentDelay *= 2; // Exponential backoff
@@ -61,59 +78,139 @@ async function startServer() {
     throw new Error("Maximum retries exceeded");
   };
 
-  // Gemini Proxy Endpoint
-  app.post("/api/gemini", async (req, res) => {
-    const { action, payload, options = {} } = req.body;
-    
-    try {
-      const ai = getGeminiClient();
-      const modelName = options.model || (action === 'generateImage' ? 'gemini-3-pro-image-preview' : 'gemini-3-flash-preview');
+  const uploadTemporaryFile = async (file: InlineFile): Promise<string> => {
+    const bytes = Buffer.from(file.data, 'base64');
+    if (bytes.length > 48 * 1024 * 1024) throw new Error('Script attachment exceeds xAI\'s 48 MB file limit.');
+    const formData = new FormData();
+    // xAI requires expires_after to precede the file field.
+    formData.append('expires_after', '3600');
+    formData.append('purpose', 'assistants');
+    formData.append('file', new Blob([new Uint8Array(bytes)], { type: file.mimeType || 'application/octet-stream' }), file.filename || 'script');
+    const response = await withRetry(() => axios.post(`${XAI_API_BASE_URL}/files`, formData, {
+      headers: { Authorization: `Bearer ${getXaiApiKey()}` },
+      timeout: 120000,
+    }), 3, 1000);
+    if (!response.data?.id) throw new Error('xAI did not return an ID for the uploaded script.');
+    return response.data.id;
+  };
 
-      if (action === 'generateContent') {
-        const result = await withRetry(() => ai.models.generateContent({
-          model: modelName,
-          contents: payload.contents,
-          config: {
-            systemInstruction: payload.systemInstruction,
-            ...(payload.generationConfig || {})
-          }
+  const deleteTemporaryFile = async (fileId: string) => {
+    try {
+      await axios.delete(`${XAI_API_BASE_URL}/files/${encodeURIComponent(fileId)}`, {
+        headers: { Authorization: `Bearer ${getXaiApiKey()}` },
+        timeout: 30000,
+      });
+    } catch (error: any) {
+      console.warn(`Could not immediately delete temporary xAI file ${fileId}: ${error.message}`);
+    }
+  };
+
+  const prepareInputFiles = async (input: any): Promise<{ input: any; uploadedIds: string[] }> => {
+    const cloned = structuredClone(input);
+    const uploadedIds: string[] = [];
+    if (!Array.isArray(cloned)) return { input: cloned, uploadedIds };
+
+    for (const message of cloned) {
+      if (!Array.isArray(message?.content)) continue;
+      for (const part of message.content) {
+        if (part?.type !== 'input_file') continue;
+        const inlineFile = part.inline_file as InlineFile | undefined;
+        if (!inlineFile) continue;
+        if (typeof inlineFile.data !== 'string' || typeof inlineFile.filename !== 'string') {
+          throw new Error('Invalid inline file attachment.');
+        }
+        const fileId = await uploadTemporaryFile(inlineFile);
+        uploadedIds.push(fileId);
+        part.file_id = fileId;
+        delete part.inline_file;
+      }
+    }
+    return { input: cloned, uploadedIds };
+  };
+
+  const extractResponseText = (response: any): string => {
+    for (const item of [...(response?.output || [])].reverse()) {
+      for (const content of [...(item?.content || [])].reverse()) {
+        if (content?.type === 'output_text' && typeof content.text === 'string') return content.text;
+      }
+    }
+    throw new Error('xAI returned no text output.');
+  };
+
+  // Server-side xAI gateway. The API key never enters the browser bundle.
+  app.post("/api/xai", async (req, res) => {
+    const { action, payload = {} } = req.body || {};
+    const uploadedIds: string[] = [];
+    try {
+      getXaiApiKey();
+
+      if (action === 'generateText') {
+        const prepared = await prepareInputFiles(payload.input);
+        uploadedIds.push(...prepared.uploadedIds);
+        const body: any = {
+          model: payload.model || process.env.XAI_TEXT_MODEL || 'grok-4.5',
+          input: prepared.input,
+          store: false,
+        };
+        if (payload.instructions) body.instructions = payload.instructions;
+        if (typeof payload.temperature === 'number') body.temperature = payload.temperature;
+        if (payload.responseSchema) {
+          body.text = {
+            format: {
+              type: 'json_schema',
+              name: payload.responseSchema.name,
+              schema: payload.responseSchema.schema,
+              strict: true,
+            },
+          };
+        }
+        const result = await withRetry(() => axios.post(`${XAI_API_BASE_URL}/responses`, body, {
+          headers: xaiHeaders(),
+          timeout: 360000,
         }));
-        return res.json({ text: result.text });
+        return res.json({ text: extractResponseText(result.data) });
       }
 
       if (action === 'generateImage') {
-        const parts = payload.contents?.[0]?.parts || [];
-        const textPart = parts.find((p: any) => p.text);
-        if (!textPart) throw new Error("No prompt found for image generation");
-
-        const prompt = textPart.text;
-        const seed = Math.floor(Math.random() * 1000000);
-        const width = 1024;
-        const height = 576; // 16:9
-
-        const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true&model=flux`;
-
-        // Fetch image and convert to base64 to maintain same interface
-        // Added retry for image fetch as well
-        const imageResponse = await withRetry(async () => {
-           return await axios.get(imageUrl, { 
-             responseType: 'arraybuffer',
-             timeout: 60000 // High timeout for image generation
-           });
-        }, 2, 2000);
-        
-        const base64Image = Buffer.from(imageResponse.data, 'binary').toString('base64');
-        const contentType = imageResponse.headers['content-type'] || 'image/jpeg';
-
-        return res.json({ 
-          image: `data:${contentType};base64,${base64Image}` 
-        });
+        if (typeof payload.prompt !== 'string' || !payload.prompt.trim()) throw new Error('Image prompt is required.');
+        const hasReference = typeof payload.referenceImage === 'string' && payload.referenceImage.length > 0;
+        const endpoint = hasReference ? 'images/edits' : 'images/generations';
+        const body: any = {
+          model: process.env.XAI_IMAGE_MODEL || 'grok-imagine-image-quality',
+          prompt: payload.prompt,
+          response_format: 'b64_json',
+          resolution: payload.resolution === '2k' ? '2k' : '1k',
+          aspect_ratio: payload.aspectRatio || '16:9',
+        };
+        if (hasReference) {
+          const imageUrl = payload.referenceImage.startsWith('data:')
+            ? payload.referenceImage
+            : `data:image/jpeg;base64,${payload.referenceImage}`;
+          body.image = { url: imageUrl, type: 'image_url' };
+        }
+        const result = await withRetry(() => axios.post(`${XAI_API_BASE_URL}/${endpoint}`, body, {
+          headers: xaiHeaders(),
+          timeout: 360000,
+        }), 4, 2000);
+        const image = result.data?.data?.[0];
+        if (image?.b64_json) return res.json({ image: `data:${image.mime_type || 'image/jpeg'};base64,${image.b64_json}` });
+        if (image?.url) {
+          const downloaded = await axios.get(image.url, { responseType: 'arraybuffer', timeout: 120000 });
+          const mimeType = downloaded.headers['content-type'] || image.mime_type || 'image/jpeg';
+          return res.json({ image: `data:${mimeType};base64,${Buffer.from(downloaded.data).toString('base64')}` });
+        }
+        throw new Error('xAI returned no generated image.');
       }
 
       res.status(400).json({ error: "Invalid action" });
     } catch (error: any) {
-      console.error("Gemini Proxy Error:", error.response?.data?.error || error.message);
-      res.status(500).json({ error: error.response?.data?.error?.message || error.message });
+      const upstream = error.response?.data?.error;
+      const message = typeof upstream === 'string' ? upstream : upstream?.message || error.message;
+      console.error("xAI Proxy Error:", message);
+      const status = error.message?.includes('XAI_API_KEY') ? 503 : (error.response?.status === 429 ? 429 : 502);
+      res.status(status).json({ error: message || 'xAI request failed.' });
+    } finally {
+      await Promise.all(uploadedIds.map(deleteTemporaryFile));
     }
   });
 
@@ -205,7 +302,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.use((req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
