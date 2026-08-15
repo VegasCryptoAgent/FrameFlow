@@ -1212,13 +1212,35 @@ const App: React.FC = () => {
                           controls 
                           crossOrigin={videoUrl.startsWith('blob:') ? undefined : 'anonymous'}
                           className="w-full h-full object-contain" 
-                          onError={(e) => {
+                          onError={async (e) => {
                             const mediaError = e.currentTarget.error;
+                            const src = e.currentTarget.currentSrc || e.currentTarget.src || videoUrl || '';
                             console.error("Video loading error:", {
                               code: mediaError?.code,
                               message: mediaError?.message
                             });
-                            setGlobalError("Access Denied: The source server (CORS) or the video format is incompatible with analysis. Direct links to .mp4 or .mov files from open hosts work best.");
+                            let message = "The video could not be decoded. Try a direct .mp4 or .webm file from an open host.";
+                            if (src.includes('/api/video-proxy')) {
+                              try {
+                                const probe = await fetch(src, { headers: { Range: 'bytes=0-0' } });
+                                const contentType = (probe.headers.get('content-type') || '').toLowerCase();
+                                if (!probe.ok && probe.status !== 206) {
+                                  const text = (await probe.text()).replace(/<[^>]+>/g, '').trim();
+                                  if (text) message = text;
+                                } else if (contentType.includes('mpegurl') || contentType.includes('dash+xml')) {
+                                  message = "The proxy resolved this to an HLS/DASH playlist the browser cannot play. Paste a direct .mp4 URL instead.";
+                                } else if (mediaError?.code === 4) {
+                                  message = "The proxied stream was not a browser-playable MP4. Paste a direct .mp4 or .webm URL instead.";
+                                }
+                              } catch {
+                                if (mediaError?.code === 2) {
+                                  message = "Network error while loading the proxied video.";
+                                }
+                              }
+                            } else if (mediaError?.code === 4) {
+                              message = "This file format is not playable, or the host blocked the request. Direct .mp4/.webm links work best.";
+                            }
+                            setGlobalError(message);
                             setStatus(AnalysisStatus.ERROR);
                           }}
                         />

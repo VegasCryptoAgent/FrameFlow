@@ -161,7 +161,9 @@ export const extractFramesFromVideo = async (
               case 1: errorMessage = "Video loading aborted."; break;
               case 2: errorMessage = "Network error while loading video."; break;
               case 3: errorMessage = "Video decoding failed. The video might be corrupted or unsupported."; break;
-              case 4: errorMessage = "Video format not supported or CORS restriction. If using an external URL, the server might not allow cross-origin access."; break;
+              case 4: errorMessage = videoUrl.includes('/api/video-proxy')
+                ? "The proxied stream was not a browser-playable MP4. Paste a direct .mp4 or .webm URL instead."
+                : "Video format not supported, or the host blocked the request. Direct .mp4/.webm links work best."; break;
             }
           }
           handleError(new Error(errorMessage));

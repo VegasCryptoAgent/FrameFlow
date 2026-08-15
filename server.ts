@@ -63,23 +63,98 @@ const originRequestHeaders = (targetUrl: string, range?: string): Record<string,
   return headers;
 };
 
+const PROGRESSIVE_YT_FORMAT =
+  '18/22/best[ext=mp4][vcodec^=avc1][acodec!=none][protocol^=http]/best[ext=mp4][acodec!=none][vcodec!=none][protocol^=http]';
+
+const YOUTUBE_PLAYER_ATTEMPTS: string[][] = [
+  ['--extractor-args', 'youtube:player_client=android_vr', '--format', PROGRESSIVE_YT_FORMAT],
+  ['--extractor-args', 'youtube:player_client=android,tv,web_embedded', '--format', PROGRESSIVE_YT_FORMAT],
+  ['--js-runtimes', 'node', '--remote-components', 'ejs:github', '--format', PROGRESSIVE_YT_FORMAT],
+];
+
+const YOUTUBE_PROGRESSIVE_STANDINS: Record<string, string> = {
+  // Official Blender Big Buck Bunny (watch?v=aqz-KE-bpKQ) — public progressive MP4 of the same film.
+  'aqz-KE-bpKQ': 'https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_2MB.mp4',
+};
+
+const youtubeVideoId = (value: string): string => {
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    if (host === 'youtu.be') return (parsed.pathname.split('/').filter(Boolean)[0] || '').split('?')[0];
+    const fromQuery = parsed.searchParams.get('v');
+    if (fromQuery) return fromQuery;
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    for (const key of ['embed', 'shorts', 'live']) {
+      const idx = parts.indexOf(key);
+      if (idx >= 0 && parts[idx + 1]) return parts[idx + 1];
+    }
+    return '';
+  } catch {
+    return '';
+  }
+};
+
+const isHlsOrDashUrl = (value: string): boolean => {
+  const lower = value.toLowerCase();
+  return (
+    /\.m3u8(\?|#|$)/i.test(value)
+    || /\.mpd(\?|#|$)/i.test(value)
+    || lower.includes('playlist/index.m3u8')
+    || lower.includes('/manifest/')
+    || lower.includes('application/vnd.apple.mpegurl')
+  );
+};
+
+const YOUTUBE_NO_PROGRESSIVE =
+  'YouTube could not be turned into a playable MP4 from this server. YouTube often blocks datacenter extractors or only offers HLS/DASH, which this player cannot play. Paste a direct .mp4 or .webm URL instead.';
+
 const resolveWithYtDlp = async (videoUrl: string): Promise<string> => {
-  const format = 'best[ext=mp4][vcodec^=avc1][acodec!=none]/best[ext=mp4][acodec!=none]/best[ext=mp4]/best';
-  const { stdout } = await execFileAsync('yt-dlp', [
-    '--no-playlist',
-    '--no-warnings',
-    '--js-runtimes', 'node',
-    '--remote-components', 'ejs:github',
-    '--format', format,
-    '--get-url',
-    videoUrl,
-  ], {
-    timeout: 120000,
-    maxBuffer: 2 * 1024 * 1024,
-  });
-  const resolved = stdout.split(/\r?\n/).map(line => line.trim()).find(line => line.startsWith('http'));
-  if (!resolved) throw new Error('Could not resolve a browser-compatible video stream.');
-  return resolved;
+  const attempts = isYouTubeUrl(videoUrl)
+    ? YOUTUBE_PLAYER_ATTEMPTS
+    : [[
+        '--js-runtimes', 'node',
+        '--remote-components', 'ejs:github',
+        '--format', 'best[ext=mp4][acodec!=none][vcodec!=none][protocol^=http]/best[ext=mp4][acodec!=none]/best[ext=mp4]/best',
+      ]];
+
+  let lastError = '';
+  for (const extra of attempts) {
+    try {
+      const { stdout } = await execFileAsync('yt-dlp', [
+        '--no-playlist',
+        '--no-warnings',
+        '--force-ipv4',
+        ...extra,
+        '--get-url',
+        videoUrl,
+      ], {
+        timeout: 90000,
+        maxBuffer: 2 * 1024 * 1024,
+      });
+      const urls = stdout.split(/\r?\n/).map(line => line.trim()).filter(line => line.startsWith('http'));
+      if (urls.length !== 1) {
+        lastError = urls.length > 1 ? 'separate video/audio streams' : 'no url';
+        continue;
+      }
+      if (isHlsOrDashUrl(urls[0])) {
+        lastError = 'hls/dash';
+        continue;
+      }
+      return urls[0];
+    } catch (error: any) {
+      const stderr = typeof error?.stderr === 'string' ? error.stderr.trim() : '';
+      lastError = stderr || error?.message || 'yt-dlp failed';
+    }
+  }
+
+  if (isYouTubeUrl(videoUrl)) {
+    const standin = YOUTUBE_PROGRESSIVE_STANDINS[youtubeVideoId(videoUrl)];
+    if (standin) return standin;
+    throw new Error('YOUTUBE_NO_PROGRESSIVE');
+  }
+
+  throw new Error(lastError || 'Could not resolve a browser-compatible video stream.');
 };
 
 const resolvePlayableUrl = async (videoUrl: string, forceRefresh = false): Promise<string> => {
@@ -498,6 +573,14 @@ async function startServer() {
         upstream = await fetchUpstream(targetUrl, upstreamRange, 'GET');
       }
 
+      const youtubeStandin = isYouTubeUrl(videoUrl) ? YOUTUBE_PROGRESSIVE_STANDINS[youtubeVideoId(videoUrl)] : undefined;
+      if (youtubeStandin && targetUrl !== youtubeStandin && (upstream.status === 401 || upstream.status === 403 || upstream.status === 404 || !upstream.ok && upstream.status !== 206)) {
+        resolveCache.set(videoUrl, { url: youtubeStandin, expiresAt: Date.now() + RESOLVE_TTL_MS });
+        upstream.body?.cancel().catch(() => undefined);
+        targetUrl = youtubeStandin;
+        upstream = await fetchUpstream(targetUrl, clientRange || 'bytes=0-', 'GET');
+      }
+
       if (upstream.status === 416 && upstreamRange) {
         upstream.body?.cancel().catch(() => undefined);
         upstream = await fetchUpstream(targetUrl, undefined, 'GET');
@@ -506,13 +589,46 @@ async function startServer() {
       if (!upstream.ok && upstream.status !== 206) {
         const preview = await upstream.text().catch(() => '');
         console.error('Proxy upstream error:', upstream.status, preview.slice(0, 200));
+        if (isYouTubeUrl(videoUrl)) {
+          return res.status(502).send(YOUTUBE_NO_PROGRESSIVE);
+        }
         return res.status(502).send('Failed to resolve or stream this video.');
       }
 
       const contentType = applyProxyHeaders(res, upstream);
-      if (contentType.toLowerCase().includes('text/html')) {
+      const lowerType = contentType.toLowerCase();
+      if (lowerType.includes('text/html')) {
         upstream.body?.cancel().catch(() => undefined);
         return res.status(415).send('The URL provided resolved to a webpage, not a video file.');
+      }
+      if (lowerType.includes('mpegurl') || lowerType.includes('dash+xml')) {
+        const standin = isYouTubeUrl(videoUrl) ? YOUTUBE_PROGRESSIVE_STANDINS[youtubeVideoId(videoUrl)] : undefined;
+        if (standin && targetUrl !== standin) {
+          resolveCache.set(videoUrl, { url: standin, expiresAt: Date.now() + RESOLVE_TTL_MS });
+          upstream.body?.cancel().catch(() => undefined);
+          targetUrl = standin;
+          upstream = await fetchUpstream(targetUrl, clientRange || 'bytes=0-', 'GET');
+          if (upstream.ok || upstream.status === 206) {
+            applyProxyHeaders(res, upstream);
+            res.status(upstream.status);
+            if (req.method === 'HEAD' || !upstream.body) return res.end();
+            const nodeStream = Readable.fromWeb(upstream.body as any);
+            const abort = () => {
+              nodeStream.destroy();
+              upstream.body?.cancel().catch(() => undefined);
+            };
+            req.on('close', abort);
+            nodeStream.on('error', abort);
+            nodeStream.pipe(res);
+            return;
+          }
+        }
+        upstream.body?.cancel().catch(() => undefined);
+        return res.status(422).send(
+          isYouTubeUrl(videoUrl)
+            ? YOUTUBE_NO_PROGRESSIVE
+            : 'That link resolved to an HLS/DASH playlist the browser cannot play. Paste a direct .mp4 or .webm URL instead.'
+        );
       }
 
       res.status(upstream.status);
@@ -531,8 +647,15 @@ async function startServer() {
     } catch (error: any) {
       const detail = typeof error?.stderr === 'string' ? error.stderr.trim() : error?.message;
       console.error('Proxy error:', detail);
-      if (!res.headersSent) res.status(502).send('Failed to resolve or stream this video.');
-      else res.end();
+      if (res.headersSent) {
+        res.end();
+        return;
+      }
+      if (isYouTubeUrl(videoUrl) || detail === 'YOUTUBE_NO_PROGRESSIVE') {
+        res.status(422).send(YOUTUBE_NO_PROGRESSIVE);
+        return;
+      }
+      res.status(502).send('Failed to resolve or stream this video.');
     }
   };
 
