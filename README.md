@@ -60,5 +60,5 @@ The included `railway.json` and `Dockerfile` configure the production build, cur
 ## Notes
 
 - Grok Imagine currently supports native 1K and 2K output. The app therefore exposes 2K for AI enhancement.
-- Remote video URLs still depend on the source allowing retrieval. YouTube and Vimeo URLs are resolved by the server proxy.
+- Remote video URLs still depend on the source allowing retrieval. YouTube URLs are resolved with yt-dlp (`android_vr` first) to a progressive MP4; HLS/DASH is rejected with an honest error. The YouTube_Sample chip (`watch?v=aqz-KE-bpKQ`) falls back to a public Big Buck Bunny MP4 (test-videos.co.uk) if YouTube blocks the server.
 - Frame images stay in browser local storage; AI requests send the selected frame to xAI for analysis or generation.

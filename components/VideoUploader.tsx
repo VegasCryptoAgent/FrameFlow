@@ -91,6 +91,26 @@ const VideoUploader: React.FC<VideoUploaderProps> = ({ onVideoSelected, disabled
       return;
     }
 
+    try {
+      const probe = await fetch(finalUrl, { headers: { Range: 'bytes=0-1' } });
+      const contentType = (probe.headers.get('content-type') || '').toLowerCase();
+      if (!probe.ok && probe.status !== 206) {
+        const text = (await probe.text()).replace(/<[^>]+>/g, '').trim();
+        setError(text || "SOURCE_ERR: Could not resolve or stream this video.");
+        setIsVerifying(false);
+        return;
+      }
+      if (contentType.includes('mpegurl') || contentType.includes('dash+xml') || contentType.includes('text/html')) {
+        setError("SOURCE_ERR: That link did not resolve to a playable MP4. Paste a direct .mp4 or .webm URL.");
+        setIsVerifying(false);
+        return;
+      }
+    } catch {
+      setError("SOURCE_ERR: Could not reach the video proxy. Try again, or use a local file.");
+      setIsVerifying(false);
+      return;
+    }
+
     setIsVerifying(false);
     onVideoSelected(null, finalUrl);
   };
@@ -215,7 +235,7 @@ const VideoUploader: React.FC<VideoUploaderProps> = ({ onVideoSelected, disabled
                Neural_Proxy_Active
              </p>
              <p className="text-[9px] font-mono text-white/40 uppercase tracking-widest leading-relaxed">
-               YouTube & Vimeo links are proxied through our vision engine. Ensure content is public.
+               YouTube is best-effort: only a progressive MP4 will play. If YouTube blocks this server or offers HLS only, you will get a clear error — use a direct .mp4 instead.
              </p>
            </div>
         </div>
@@ -247,8 +267,8 @@ const VideoUploader: React.FC<VideoUploaderProps> = ({ onVideoSelected, disabled
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-[9px] font-mono text-white/30 uppercase leading-loose">
               <div className="space-y-1">
-                <p className="text-white/50 font-black">CORS_BYPASS</p>
-                <p>Proxy resolves platform links. Direct files still preferred.</p>
+                <p className="text-white/50 font-black">PROXY_RESOLVE</p>
+                <p>Platform links are resolved server-side. Direct .mp4 files are more reliable.</p>
               </div>
               <div className="space-y-1">
                 <p className="text-white/50 font-black">EXTRACTION_LATENCY</p>
