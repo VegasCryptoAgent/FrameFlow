@@ -7,18 +7,20 @@ interface VideoUploaderProps {
   disabled: boolean;
 }
 
+export const SAMPLE_VIDEOS = [
+  { name: 'Bunny_Test', url: 'https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4' },
+  { name: 'Flower_Test', url: 'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4' },
+  { name: 'YouTube_Sample', url: 'https://www.youtube.com/watch?v=aqz-KE-bpKQ' },
+];
+
+export const proxyVideoUrl = (url: string) => `/api/video-proxy?url=${encodeURIComponent(url)}`;
+
 const VideoUploader: React.FC<VideoUploaderProps> = ({ onVideoSelected, disabled }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragActive, setDragActive] = useState(false);
   const [inputUrl, setInputUrl] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isVerifying, setIsVerifying] = useState(false);
-
-  const SAMPLES = [
-    { name: 'Bunny_Test', url: 'https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4' },
-    { name: 'YouTube_Sample', url: 'https://www.youtube.com/watch?v=aqz-KE-bpKQ' },
-    { name: 'Vimeo_Sample', url: 'https://vimeo.com/76979871' }
-  ];
 
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
@@ -195,7 +197,7 @@ const VideoUploader: React.FC<VideoUploaderProps> = ({ onVideoSelected, disabled
 
         <div className="flex flex-wrap items-center gap-2">
            <span className="text-[8px] font-black text-white/20 uppercase tracking-widest mr-2">Try_Samples:</span>
-           {SAMPLES.map(sample => (
+           {SAMPLE_VIDEOS.map(sample => (
              <button
                key={sample.name}
                onClick={() => handleUrlSubmit(sample.url)}

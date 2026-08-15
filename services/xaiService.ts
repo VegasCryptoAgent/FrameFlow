@@ -23,14 +23,33 @@ interface XaiContentPart {
 
 const DEFAULT_TEXT_MODEL = 'grok-4.5';
 
+const toUserFacingError = (error: any): Error => {
+  const raw = String(error?.response?.data?.error || error?.message || '');
+  const lower = raw.toLowerCase();
+  if (
+    raw === 'AI analysis is temporarily unavailable because the provider limit was reached. Try again later.'
+    || raw === 'AI analysis failed. Please try again.'
+    || raw === 'AI analysis is not available right now.'
+  ) {
+    return new Error(raw);
+  }
+  if (/credit|quota|rate limit|resource.?exhausted|too many requests|insufficient|billing|spend limit|429/.test(lower)) {
+    return new Error('AI analysis is temporarily unavailable because the provider limit was reached. Try again later.');
+  }
+  if (/not configured|xai_api_key is not/.test(lower)) {
+    return new Error('AI analysis is not available right now.');
+  }
+  return new Error('AI analysis failed. Please try again.');
+};
+
 const callXaiProxy = async <T>(action: 'generateText' | 'generateImage', payload: unknown): Promise<T> => {
   try {
     const response = await axios.post<T>("/api/xai", { action, payload });
     return response.data;
   } catch (error: any) {
-    const message = error.response?.data?.error || error.message;
-    console.error(`xAI Proxy Error (${action}):`, message);
-    throw new Error(message || 'Failed to communicate with the xAI server.');
+    const safe = toUserFacingError(error);
+    console.error(`xAI Proxy Error (${action}):`, safe.message);
+    throw safe;
   }
 };
 
