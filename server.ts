@@ -6,21 +6,65 @@ import axios from "axios";
 import PDFDocument from "pdfkit";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { Readable } from "node:stream";
 
 const XAI_API_BASE_URL = 'https://api.x.ai/v1';
 const execFileAsync = promisify(execFile);
 
-const isYouTubeUrl = (value: string): boolean => {
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+const RESOLVE_TTL_MS = 8 * 60 * 1000;
+const resolveCache = new Map<string, { url: string; expiresAt: number }>();
+const resolveInflight = new Map<string, Promise<string>>();
+
+const hostnameOf = (value: string): string => {
   try {
-    const hostname = new URL(value).hostname.toLowerCase().replace(/^www\./, '');
-    return hostname === 'youtube.com' || hostname.endsWith('.youtube.com') || hostname === 'youtu.be';
+    return new URL(value).hostname.toLowerCase().replace(/^www\./, '');
   } catch {
-    return false;
+    return '';
   }
 };
 
-const resolveYouTubeUrl = async (videoUrl: string): Promise<string> => {
-  const format = 'best[ext=mp4][vcodec^=avc1][acodec!=none]/best[ext=mp4][acodec!=none]/best';
+const isYouTubeUrl = (value: string): boolean => {
+  const hostname = hostnameOf(value);
+  return hostname === 'youtube.com' || hostname.endsWith('.youtube.com') || hostname === 'youtu.be';
+};
+
+const isVimeoUrl = (value: string): boolean => {
+  const hostname = hostnameOf(value);
+  return hostname === 'vimeo.com' || hostname.endsWith('.vimeo.com') || hostname === 'player.vimeo.com';
+};
+
+const isDirectMediaUrl = (value: string): boolean => /\.(mp4|m4v|webm|mov|mkv|ogv)(\?|#|$)/i.test(value);
+
+const needsPlatformResolver = (value: string): boolean => isYouTubeUrl(value) || isVimeoUrl(value) || !isDirectMediaUrl(value);
+
+const originRequestHeaders = (targetUrl: string, range?: string): Record<string, string> => {
+  const headers: Record<string, string> = {
+    'User-Agent': BROWSER_UA,
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Connection': 'keep-alive',
+  };
+  const hostname = hostnameOf(targetUrl);
+  if (hostname.includes('googlevideo.com') || isYouTubeUrl(targetUrl)) {
+    headers.Referer = 'https://www.youtube.com/';
+    headers.Origin = 'https://www.youtube.com';
+  } else if (hostname.includes('vimeo') || hostname.includes('vimeocdn')) {
+    headers.Referer = 'https://vimeo.com/';
+    headers.Origin = 'https://vimeo.com';
+  } else {
+    try {
+      headers.Referer = `${new URL(targetUrl).origin}/`;
+    } catch {
+      // ignore
+    }
+  }
+  if (range) headers.Range = range;
+  return headers;
+};
+
+const resolveWithYtDlp = async (videoUrl: string): Promise<string> => {
+  const format = 'best[ext=mp4][vcodec^=avc1][acodec!=none]/best[ext=mp4][acodec!=none]/best[ext=mp4]/best';
   const { stdout } = await execFileAsync('yt-dlp', [
     '--no-playlist',
     '--no-warnings',
@@ -33,9 +77,54 @@ const resolveYouTubeUrl = async (videoUrl: string): Promise<string> => {
     timeout: 120000,
     maxBuffer: 2 * 1024 * 1024,
   });
-  const resolved = stdout.split(/\r?\n/).map(line => line.trim()).find(Boolean);
-  if (!resolved || !resolved.startsWith('http')) throw new Error('YouTube did not return a browser-compatible video stream.');
+  const resolved = stdout.split(/\r?\n/).map(line => line.trim()).find(line => line.startsWith('http'));
+  if (!resolved) throw new Error('Could not resolve a browser-compatible video stream.');
   return resolved;
+};
+
+const resolvePlayableUrl = async (videoUrl: string, forceRefresh = false): Promise<string> => {
+  if (!needsPlatformResolver(videoUrl)) return videoUrl;
+  const cached = resolveCache.get(videoUrl);
+  if (!forceRefresh && cached && cached.expiresAt > Date.now()) return cached.url;
+  if (!forceRefresh) {
+    const pending = resolveInflight.get(videoUrl);
+    if (pending) return pending;
+  }
+  const task = resolveWithYtDlp(videoUrl)
+    .then(url => {
+      resolveCache.set(videoUrl, { url, expiresAt: Date.now() + RESOLVE_TTL_MS });
+      return url;
+    })
+    .finally(() => {
+      resolveInflight.delete(videoUrl);
+    });
+  resolveInflight.set(videoUrl, task);
+  return task;
+};
+
+const extractUpstreamMessage = (error: any): string => {
+  const upstream = error?.response?.data?.error;
+  if (typeof upstream === 'string') return upstream;
+  if (upstream && typeof upstream.message === 'string') return upstream.message;
+  if (typeof error?.message === 'string') return error.message;
+  return '';
+};
+
+const publicXaiError = (error: any): { status: number; message: string } => {
+  const upstreamStatus = error?.response?.status;
+  const raw = extractUpstreamMessage(error);
+  console.error('xAI Proxy Error:', upstreamStatus || 'unknown', raw);
+  const text = raw.toLowerCase();
+  if (error?.message?.includes('XAI_API_KEY') || upstreamStatus === 401) {
+    return { status: 503, message: 'AI analysis is not available right now.' };
+  }
+  if (
+    upstreamStatus === 429
+    || /credit|quota|rate limit|resource.?exhausted|too many requests|insufficient|billing|spend limit/.test(text)
+  ) {
+    return { status: 429, message: 'AI analysis is temporarily unavailable because the provider limit was reached. Try again later.' };
+  }
+  return { status: upstreamStatus === 400 ? 400 : 502, message: 'AI analysis failed. Please try again.' };
 };
 
 const cleanPdfText = (value: unknown): string => String(value || '')
@@ -252,11 +341,8 @@ async function startServer() {
 
       res.status(400).json({ error: "Invalid action" });
     } catch (error: any) {
-      const upstream = error.response?.data?.error;
-      const message = typeof upstream === 'string' ? upstream : upstream?.message || error.message;
-      console.error("xAI Proxy Error:", message);
-      const status = error.message?.includes('XAI_API_KEY') ? 503 : (error.response?.status === 429 ? 429 : 502);
-      res.status(status).json({ error: message || 'xAI request failed.' });
+      const safe = publicXaiError(error);
+      res.status(safe.status).json({ error: safe.message });
     } finally {
       await Promise.all(uploadedIds.map(deleteTemporaryFile));
     }
@@ -364,76 +450,94 @@ async function startServer() {
     }
   });
 
-  // Proxy route for videos to bypass CORS and resolve YouTube/Vimeo
-  app.get("/api/video-proxy", async (req, res) => {
-    const videoUrl = req.query.url as string;
-    const range = req.headers.range;
+  const applyProxyHeaders = (res: express.Response, upstream: Response) => {
+    const contentType = upstream.headers.get('content-type') || 'video/mp4';
+    res.setHeader('Content-Type', contentType);
+    const contentLength = upstream.headers.get('content-length');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+    const contentRange = upstream.headers.get('content-range');
+    if (contentRange) res.setHeader('Content-Range', contentRange);
+    res.setHeader('Accept-Ranges', upstream.headers.get('accept-ranges') || 'bytes');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Expose-Headers', 'Accept-Ranges, Content-Length, Content-Range, Content-Type');
+    res.setHeader('Cache-Control', 'no-store');
+    return contentType;
+  };
 
+  const fetchUpstream = async (targetUrl: string, range?: string, method: 'GET' | 'HEAD' = 'GET') => {
+    return fetch(targetUrl, {
+      method,
+      headers: originRequestHeaders(targetUrl, range),
+      redirect: 'follow',
+    });
+  };
+
+  const handleVideoProxy = async (req: express.Request, res: express.Response) => {
+    const rawUrl = req.query.url;
+    const videoUrl = Array.isArray(rawUrl) ? String(rawUrl[0] || '') : String(rawUrl || '');
     if (!videoUrl) {
-      return res.status(400).send("URL parameter is required");
+      return res.status(400).send('URL parameter is required');
     }
+
+    const clientRange = typeof req.headers.range === 'string' ? req.headers.range : undefined;
+    const isPlatform = needsPlatformResolver(videoUrl);
+    // YouTube/Vimeo CDNs reject un-ranged full GETs. Always send a Range so
+    // the browser can learn the size and keep using 206 range requests.
+    const rangeToSend = clientRange || (isPlatform ? 'bytes=0-' : undefined);
 
     try {
-      let targetUrl = videoUrl;
+      // Many CDNs, including googlevideo, reject HEAD. Probe with a tiny range GET instead.
+      const upstreamRange = req.method === 'HEAD' ? (clientRange || 'bytes=0-0') : rangeToSend;
+      let targetUrl = await resolvePlayableUrl(videoUrl);
+      let upstream = await fetchUpstream(targetUrl, upstreamRange, 'GET');
 
-      // Resolve a fresh progressive MP4 with yt-dlp. YouTube now rejects the
-      // archived ytdl-core resolver with 403s on many hosted environments.
-      if (isYouTubeUrl(videoUrl)) {
-        targetUrl = await resolveYouTubeUrl(videoUrl);
+      if ((upstream.status === 401 || upstream.status === 403 || upstream.status === 404) && isPlatform) {
+        resolveCache.delete(videoUrl);
+        targetUrl = await resolvePlayableUrl(videoUrl, true);
+        upstream.body?.cancel().catch(() => undefined);
+        upstream = await fetchUpstream(targetUrl, upstreamRange, 'GET');
       }
 
-      // Handle Vimeo
-      else if (videoUrl.includes('vimeo.com')) {
-          const vimeoId = videoUrl.split('/').pop();
-          if (vimeoId) {
-              const configRes = await axios.get(`https://player.vimeo.com/video/${vimeoId}/config`);
-              const streams = configRes.data?.request?.files?.progressive;
-              if (streams && streams.length > 0) {
-                  const bestStream = streams.sort((a: any, b: any) => b.width - a.width)[0];
-                  targetUrl = bestStream.url;
-              }
-          }
+      if (upstream.status === 416 && upstreamRange) {
+        upstream.body?.cancel().catch(() => undefined);
+        upstream = await fetchUpstream(targetUrl, undefined, 'GET');
       }
 
-      // Proxy the request with range support
-      const proxyHeaders: any = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      };
-
-      if (range) {
-        proxyHeaders['Range'] = range;
+      if (!upstream.ok && upstream.status !== 206) {
+        const preview = await upstream.text().catch(() => '');
+        console.error('Proxy upstream error:', upstream.status, preview.slice(0, 200));
+        return res.status(502).send('Failed to resolve or stream this video.');
       }
 
-      const response = await axios({
-          method: 'get',
-          url: targetUrl,
-          responseType: 'stream',
-          headers: proxyHeaders,
-          timeout: 60000
-      });
-
-      const contentType = String(response.headers['content-type'] || 'video/mp4');
+      const contentType = applyProxyHeaders(res, upstream);
       if (contentType.toLowerCase().includes('text/html')) {
-          return res.status(415).send("The URL provided resolved to a webpage, not a video file.");
+        upstream.body?.cancel().catch(() => undefined);
+        return res.status(415).send('The URL provided resolved to a webpage, not a video file.');
       }
 
-      // Forward status and headers
-      res.status(response.status);
-      Object.entries(response.headers).forEach(([key, value]) => {
-        if (['content-type', 'content-length', 'content-range', 'accept-ranges'].includes(key.toLowerCase())) {
-          res.setHeader(key, value as string);
-        }
-      });
+      res.status(upstream.status);
+      if (req.method === 'HEAD' || !upstream.body) {
+        return res.end();
+      }
 
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      response.data.pipe(res);
-
+      const nodeStream = Readable.fromWeb(upstream.body as any);
+      const abort = () => {
+        nodeStream.destroy();
+        upstream.body?.cancel().catch(() => undefined);
+      };
+      req.on('close', abort);
+      nodeStream.on('error', abort);
+      nodeStream.pipe(res);
     } catch (error: any) {
-      const detail = error.stderr?.trim() || error.response?.data?.toString?.() || error.message;
-      console.error("Proxy error:", detail);
-      res.status(502).send(`Failed to resolve or stream this video. ${detail}`);
+      const detail = typeof error?.stderr === 'string' ? error.stderr.trim() : error?.message;
+      console.error('Proxy error:', detail);
+      if (!res.headersSent) res.status(502).send('Failed to resolve or stream this video.');
+      else res.end();
     }
-  });
+  };
+
+  app.get('/api/video-proxy', handleVideoProxy);
+  app.head('/api/video-proxy', handleVideoProxy);
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {

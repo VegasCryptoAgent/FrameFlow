@@ -27,7 +27,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 
 // Local imports
-import VideoUploader from './components/VideoUploader';
+import VideoUploader, { SAMPLE_VIDEOS, proxyVideoUrl } from './components/VideoUploader';
 import FrameCard from './components/FrameCard';
 import StoryboardView from './components/StoryboardView';
 import { extractFramesFromVideo } from './utils/videoProcessor';
@@ -96,6 +96,14 @@ const App: React.FC = () => {
 
   const [progress, setProgress] = useState(0);
   const [globalError, setGlobalError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
+
+  const showNotice = (message: string) => {
+    setActionNotice(message);
+    if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = window.setTimeout(() => setActionNotice(null), 4500);
+  };
   
   // Refs
   const templateTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -442,30 +450,74 @@ const App: React.FC = () => {
     }
   };
 
+  const formatShotClock = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60).toString().padStart(2, '0');
+    return `${mins}:${secs}`;
+  };
+
+  const buildLocalNarrative = (sourceFrames: FrameData[]) => {
+    const analyzed = sourceFrames.filter(f => f.prompt).length;
+    const shots = sourceFrames
+      .slice()
+      .sort((a, b) => a.timestamp - b.timestamp)
+      .map((frame, index) => {
+        const title = `SHOT ${String(index + 1).padStart(2, '0')}  ${formatShotClock(frame.timestamp)}`;
+        const body = frame.prompt || 'Frame captured. AI interpretation was unavailable for this shot.';
+        return `${title}\n${body}`;
+      })
+      .join('\n\n');
+    return [
+      'LOGLINE:',
+      `A ${sourceFrames.length}-shot storyboard assembled from the extracted video frames.`,
+      '',
+      'TREATMENT:',
+      analyzed
+        ? `${analyzed} of ${sourceFrames.length} shots include AI production notes. Remaining shots keep their captured stills so the board can still be reviewed and exported.`
+        : 'AI analysis was unavailable, so this board uses the extracted stills and timestamps. You can still review the sequence and export a PDF.',
+      '',
+      'SCENE BREAKDOWN:',
+      shots,
+    ].join('\n');
+  };
+
   const handleCreateStoryboard = async () => {
+    if (frames.length === 0) {
+      showNotice('Extract frames before building a storyboard.');
+      return;
+    }
+
     if (storyScript) {
-        setIsStoryboardMode(true);
-        return;
+      setIsStoryboardMode(true);
+      return;
     }
 
     const validPrompts = frames
       .map(f => f.prompt)
       .filter((p): p is string => typeof p === 'string' && p.length > 0);
 
-    if (validPrompts.length === 0) return;
-
-    if (!(await ensureApiKey())) return;
-
     setIsGeneratingScript(true);
     try {
-        const script = await generateStoryScript(validPrompts, settings.xaiModel);
-        setStoryScript(script);
-        setIsStoryboardMode(true);
-    } catch (e) {
-        console.error("Failed to generate storyboard script", e);
-        alert("Failed to generate storyboard script.");
+      if (validPrompts.length > 0) {
+        try {
+          await checkXaiConfiguration();
+          const script = await generateStoryScript(validPrompts, settings.xaiModel);
+          setStoryScript(script);
+          setIsStoryboardMode(true);
+          showNotice('Storyboard ready. You can export a PDF from the board.');
+          return;
+        } catch (error) {
+          console.error('Failed to generate storyboard script', error);
+        }
+      }
+
+      setStoryScript(buildLocalNarrative(frames));
+      setIsStoryboardMode(true);
+      showNotice(validPrompts.length === 0
+        ? 'Opened a visual storyboard from the extracted frames. PDF export is available.'
+        : 'Opened a local storyboard after AI narrative generation failed. PDF export is available.');
     } finally {
-        setIsGeneratingScript(false);
+      setIsGeneratingScript(false);
     }
   };
 
@@ -1172,10 +1224,40 @@ const App: React.FC = () => {
                         />
                       </div>
                       
-                      {/* Floating Control Bar Overlay */}
-                      <div className="absolute -bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-brutal border border-white/10 p-2 rounded-2xl shadow-2xl whitespace-nowrap">
+                      {status === AnalysisStatus.ERROR && (
+                        <div className="mt-4 flex flex-col sm:flex-row sm:items-start gap-3 p-4 bg-red-500/10 border border-red-500/30 rounded-2xl min-w-0 w-full">
+                          <AlertCircle className="w-6 h-6 text-red-500 shrink-0" />
+                          <div className="min-w-0 flex-1">
+                            <div className="text-[10px] font-black uppercase tracking-widest text-red-500 mb-1">System_Fault</div>
+                            <div className="text-xs text-red-200/70 font-mono leading-relaxed mb-3 break-words whitespace-normal">
+                              {globalError || "Unknown processing error"}
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-[9px] font-black text-white/20 uppercase tracking-widest">Try_Working_Links:</span>
+                              {SAMPLE_VIDEOS.slice(0, 2).map(sample => (
+                                <button
+                                  key={sample.name}
+                                  onClick={() => handleVideoSelected(null, proxyVideoUrl(sample.url))}
+                                  className="text-[9px] font-mono text-neon/60 hover:text-neon underline underline-offset-4"
+                                >
+                                  {sample.name === 'Bunny_Test' ? 'Sample_1' : 'Sample_2'}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                          <button
+                            onClick={handleReset}
+                            className="shrink-0 w-full sm:w-auto px-6 py-3 bg-red-500 text-white text-[10px] font-black uppercase tracking-widest hover:bg-red-600 transition-colors rounded-xl"
+                          >
+                            Abort_&_Reset
+                          </button>
+                        </div>
+                      )}
+
+                      {status !== AnalysisStatus.ERROR && (
+                      <div className="mt-4 flex flex-wrap items-center justify-center gap-2 w-full max-w-full bg-brutal border border-white/10 p-2 rounded-2xl shadow-2xl">
                         {status === AnalysisStatus.IDLE && (
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center justify-center gap-2">
                             <button
                               onClick={startAnalysis}
                               className="flex items-center gap-3 px-8 py-4 bg-neon text-black font-black uppercase tracking-tighter hover:scale-105 transition-transform"
@@ -1193,14 +1275,14 @@ const App: React.FC = () => {
                         )}
                         
                         {(status === AnalysisStatus.EXTRACTING || status === AnalysisStatus.ANALYZING) && (
-                          <div className="flex items-center gap-6 px-8 py-4 bg-white/5">
+                          <div className="flex flex-wrap items-center justify-center gap-4 px-4 py-4 bg-white/5 min-w-0 w-full">
                             <div className="flex items-center gap-3">
                               <Loader2 className="w-5 h-5 animate-spin text-neon" />
                               <span className="text-[10px] font-black uppercase tracking-widest text-neon">
                                 {status === AnalysisStatus.EXTRACTING ? 'Splitting' : 'Analyzing'}
                               </span>
                             </div>
-                            <div className="w-48 h-2 bg-white/10 rounded-full overflow-hidden">
+                            <div className="w-32 sm:w-48 h-2 bg-white/10 rounded-full overflow-hidden">
                               <motion.div 
                                 initial={{ width: 0 }}
                                 animate={{ width: `${progress}%` }}
@@ -1212,7 +1294,7 @@ const App: React.FC = () => {
                         )}
 
                         {status === AnalysisStatus.COMPLETED && (
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center justify-center gap-2">
                              <button
                               onClick={handleGenerateAllImages}
                               disabled={isBulkGeneratingImages}
@@ -1237,42 +1319,8 @@ const App: React.FC = () => {
                              </button>
                           </div>
                         )}
-
-                        {status === AnalysisStatus.ERROR && (
-                          <div className="flex flex-col md:flex-row items-center gap-4 px-6 py-4 bg-red-500/10 border border-red-500/30 rounded-2xl max-w-2xl">
-                             <AlertCircle className="w-6 h-6 text-red-500 flex-shrink-0" />
-                             <div className="flex-grow">
-                               <div className="text-[10px] font-black uppercase tracking-widest text-red-500 mb-1">System_Fault</div>
-                               <div className="text-xs text-red-200/70 font-mono leading-relaxed mb-3">
-                                 {globalError || "Unknown processing error"}
-                               </div>
-                               <div className="flex items-center gap-2">
-                                 <span className="text-[9px] font-black text-white/20 uppercase tracking-widest">Try_Working_Links:</span>
-                                 <button 
-                                   onClick={() => handleVideoSelected(null, 'https://storage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4')}
-                                   className="text-[9px] font-mono text-neon/60 hover:text-neon underline underline-offset-4"
-                                 >
-                                   Sample_1
-                                 </button>
-                                 <button 
-                                   onClick={() => handleVideoSelected(null, 'https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4')}
-                                   className="text-[9px] font-mono text-neon/60 hover:text-neon underline underline-offset-4"
-                                 >
-                                   Sample_2
-                                 </button>
-                               </div>
-                             </div>
-                             <div className="flex flex-col gap-2 w-full md:w-auto">
-                               <button
-                                 onClick={handleReset}
-                                 className="px-6 py-3 bg-red-500 text-white text-[10px] font-black uppercase tracking-widest hover:bg-red-600 transition-colors rounded-xl"
-                               >
-                                 Abort_&_Reset
-                               </button>
-                             </div>
-                          </div>
-                        )}
                       </div>
+                      )}
                     </div>
 
                     {/* Prompts Section */}
@@ -1399,6 +1447,19 @@ const App: React.FC = () => {
           )}
         </AnimatePresence>
       </main>
+
+      <AnimatePresence>
+        {actionNotice && (
+          <motion.div
+            initial={{ y: 40, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 40, opacity: 0 }}
+            className="fixed bottom-6 right-6 z-[120] max-w-sm px-4 py-3 bg-black border border-neon/40 text-[10px] font-mono uppercase tracking-widest text-neon shadow-[6px_6px_0_rgba(0,255,0,0.12)]"
+          >
+            {actionNotice}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Floating Action Menu - Simplified and brutalist */}
       <AnimatePresence>
