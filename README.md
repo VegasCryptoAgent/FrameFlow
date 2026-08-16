@@ -62,3 +62,13 @@ The included `railway.json` and `Dockerfile` configure the production build, cur
 - Grok Imagine currently supports native 1K and 2K output. The app therefore exposes 2K for AI enhancement.
 - Remote video URLs still depend on the source allowing retrieval. YouTube URLs are resolved with yt-dlp (`android_vr` first) to a progressive MP4; HLS/DASH is rejected with an honest error. The YouTube_Sample chip (`watch?v=aqz-KE-bpKQ`) falls back to a public Big Buck Bunny MP4 (test-videos.co.uk) if YouTube blocks the server.
 - Frame images stay in browser local storage; AI requests send the selected frame to xAI for analysis or generation.
+
+## Production packet and verify pass
+
+After frame analysis, FrameFlow runs a local verify pass (no extra API keys) and can export a production packet:
+
+- Continuity passport — locked subject, wardrobe, lighting, and palette language to paste into every shot prompt
+- Quality report — missing prompts, analysis errors, coverage gaps, duplicate prompts, lighting drift
+- Shot inventory / EDL — timestamped shot list as `frameflow-packet.json` plus `frameflow-edl.md`
+
+Use **Verify** to reopen the report, **Lock Passport** to stamp it into Config (`{{PASSPORT}}` + directives), and **Export Packet** to download JSON + markdown. Re-run analysis after locking so every prompt carries the same identity block.
