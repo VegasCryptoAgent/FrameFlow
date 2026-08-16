@@ -22,7 +22,9 @@ import {
   FileText,
   ChevronRight,
   Maximize2,
-  Terminal
+  Terminal,
+  ShieldCheck,
+  ClipboardList
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -31,6 +33,12 @@ import VideoUploader, { SAMPLE_VIDEOS, proxyVideoUrl } from './components/VideoU
 import FrameCard from './components/FrameCard';
 import StoryboardView from './components/StoryboardView';
 import { extractFramesFromVideo } from './utils/videoProcessor';
+import {
+  buildProductionPacket,
+  downloadTextFile,
+  packetToMarkdown,
+  type QualityReport,
+} from './utils/productionPacket';
 import { 
   generateFramePrompt, 
   generateImage, 
@@ -56,6 +64,7 @@ const TEMPLATE_VARIABLES = [
   { name: 'ENVIRONMENT', description: 'Setting/Background' },
   { name: 'LIGHTING', description: 'Lighting/Mood' },
   { name: 'CAMERA', description: 'Angle/Lens/Shot type' },
+  { name: 'PASSPORT', description: 'Locked continuity passport block' },
 ];
 
 const App: React.FC = () => {
@@ -97,6 +106,9 @@ const App: React.FC = () => {
   const [progress, setProgress] = useState(0);
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [qualityReport, setQualityReport] = useState<QualityReport | null>(null);
+  const [showVerify, setShowVerify] = useState(false);
+  const [passportBlock, setPassportBlock] = useState<string | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
 
   const showNotice = (message: string) => {
@@ -140,6 +152,15 @@ const App: React.FC = () => {
     promptTemplate: '{{PROMPT}}' // Default template
   });
   const [showSettings, setShowSettings] = useState(false);
+
+  useEffect(() => {
+    if (status !== AnalysisStatus.COMPLETED || frames.length === 0) return;
+    if (frames.some((frame) => frame.isAnalyzing)) return;
+    const packet = buildProductionPacket(frames, settings.samplingInterval);
+    setQualityReport(packet.report);
+    setPassportBlock(packet.passport.lockedBlock);
+    setShowVerify(true);
+  }, [status, frames, settings.samplingInterval]);
   const [suggestionState, setSuggestionState] = useState<{
     show: boolean;
     x: number;
@@ -176,6 +197,9 @@ const App: React.FC = () => {
     setRemixIdea('');
     setRemixScriptFile(null);
     setRemixChatHistory([]);
+    setQualityReport(null);
+    setShowVerify(false);
+    setPassportBlock(null);
 
     if (file) {
       const objectUrl = URL.createObjectURL(file);
@@ -204,6 +228,9 @@ const App: React.FC = () => {
     setRemixIdea('');
     setRemixScriptFile(null);
     setRemixChatHistory([]);
+    setQualityReport(null);
+    setShowVerify(false);
+    setPassportBlock(null);
   };
 
   const startAnalysis = async () => {
@@ -217,6 +244,8 @@ const App: React.FC = () => {
     setGlobalError(null);
     setSelectedFrameIds(new Set<string>()); // Clear selection on new analysis
     setStoryScript(null); // Reset script
+    setQualityReport(null);
+    setShowVerify(false);
 
     try {
       // 1. Extract Frames
@@ -256,7 +285,7 @@ const App: React.FC = () => {
           try {
             const { prompt, metadata } = await generateFramePrompt(frame.imageUrl, {
               customInstructions: settings.customInstructions,
-              template: settings.promptTemplate,
+              template: resolvePromptTemplate(),
               model: settings.xaiModel
             });
             setFrames(prev => prev.map(f => 
@@ -294,6 +323,22 @@ const App: React.FC = () => {
     }
   };
 
+  const runVerifyPass = (sourceFrames: FrameData[] = frames) => {
+    const packet = buildProductionPacket(sourceFrames, settings.samplingInterval);
+    setQualityReport(packet.report);
+    setPassportBlock(packet.passport.lockedBlock);
+    setShowVerify(true);
+    return packet;
+  };
+
+  const resolvePromptTemplate = () => {
+    if (!passportBlock || !settings.promptTemplate.includes('{{PASSPORT}}')) {
+      return settings.promptTemplate;
+    }
+    return settings.promptTemplate.replaceAll('{{PASSPORT}}', passportBlock);
+  };
+
+
   const handleRetryFrame = async (frameId: string) => {
     const frame = frames.find(f => f.id === frameId);
     if (!frame) return;
@@ -305,7 +350,7 @@ const App: React.FC = () => {
     try {
       const { prompt, metadata } = await generateFramePrompt(frame.imageUrl, {
         customInstructions: settings.customInstructions,
-        template: settings.promptTemplate,
+        template: resolvePromptTemplate(),
         model: settings.xaiModel
       });
       setFrames(prev => prev.map(f => 
@@ -584,7 +629,7 @@ const App: React.FC = () => {
           try {
             const remixPrompt = await generateRemixPrompt(frame.prompt, remixIdea, scriptData, {
               customInstructions: settings.customInstructions,
-              template: settings.promptTemplate,
+              template: resolvePromptTemplate(),
               model: settings.xaiModel,
               storyContext: newScript
             });
@@ -746,14 +791,37 @@ const App: React.FC = () => {
       .filter(f => f.prompt)
       .map(f => `[${f.timestamp.toFixed(2)}s]\n${f.prompt}\n`)
       .join('\n-------------------\n\n');
-    
-    const blob = new Blob([textContent], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'prompts.txt';
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadTextFile('prompts.txt', textContent);
+  };
+
+  const handleExportProductionPacket = () => {
+    if (frames.length === 0) {
+      showNotice('Extract frames before exporting a production packet.');
+      return;
+    }
+    const packet = runVerifyPass(frames);
+    downloadTextFile('frameflow-packet.json', JSON.stringify(packet, null, 2), 'application/json');
+    downloadTextFile('frameflow-edl.md', packetToMarkdown(packet), 'text/markdown');
+    showNotice(packet.report.ready
+      ? `Exported packet + EDL. Verify score ${packet.report.score}/100.`
+      : `Exported packet + EDL with ${packet.report.issues.filter(i => i.severity === 'fail').length} blocking issues.`);
+  };
+
+  const handleLockPassport = () => {
+    const packet = runVerifyPass(frames);
+    const block = packet.passport.lockedBlock;
+    const nextInstructions = settings.customInstructions.includes('CONTINUITY PASSPORT')
+      ? settings.customInstructions
+      : [settings.customInstructions.trim(), block].filter(Boolean).join('\n\n');
+    const nextTemplate = settings.promptTemplate.includes('{{PASSPORT}}')
+      ? settings.promptTemplate
+      : `{{PASSPORT}}\n\n{{PROMPT}}`;
+    setSettings({
+      ...settings,
+      customInstructions: nextInstructions,
+      promptTemplate: nextTemplate,
+    });
+    showNotice('Locked continuity passport into Config directives and {{PASSPORT}} template. Re-run analysis to stamp it on every shot.');
   };
 
   // Selection Handlers
@@ -889,7 +957,7 @@ const App: React.FC = () => {
           try {
               const { prompt, metadata } = await generateFramePrompt(frame.imageUrl, {
                 customInstructions: settings.customInstructions,
-                template: settings.promptTemplate,
+                template: resolvePromptTemplate(),
                 model: settings.xaiModel
               });
                setFrames(prev => prev.map(f => 
@@ -1333,6 +1401,20 @@ const App: React.FC = () => {
                               {isGeneratingScript ? <Loader2 className="w-4 h-4 animate-spin" /> : <BookOpen className="w-4 h-4" />}
                               Build Story
                             </button>
+                            <button
+                              onClick={() => runVerifyPass(frames)}
+                              className="flex items-center gap-3 px-6 py-4 border border-white/10 text-white font-black uppercase tracking-tighter hover:bg-white/5 transition-colors"
+                            >
+                              <ShieldCheck className="w-4 h-4" />
+                              Verify
+                            </button>
+                            <button
+                              onClick={handleExportProductionPacket}
+                              className="flex items-center gap-3 px-6 py-4 border border-neon/40 text-neon font-black uppercase tracking-tighter hover:bg-neon/10 transition-colors"
+                            >
+                              <ClipboardList className="w-4 h-4" />
+                              Export Packet
+                            </button>
                              <button
                                onClick={handleReset}
                                className="p-4 text-white/40 hover:text-red-500 transition-colors"
@@ -1344,6 +1426,62 @@ const App: React.FC = () => {
                       </div>
                       )}
                     </div>
+
+                    {showVerify && qualityReport && (
+                      <div className="border border-white/10 bg-black/50 p-6 space-y-4 rounded-2xl">
+                        <div className="flex flex-wrap items-start justify-between gap-4">
+                          <div>
+                            <div className="text-[10px] font-black uppercase tracking-widest text-neon mb-1">Verify_Pass</div>
+                            <h3 className="text-2xl font-black font-display uppercase tracking-tight">
+                              Score <span className={qualityReport.ready ? 'text-neon' : 'text-red-400'}>{qualityReport.score}/100</span>
+                            </h3>
+                            <p className="text-sm text-white/60 mt-1">{qualityReport.summary}</p>
+                            <p className="text-[10px] font-mono uppercase tracking-widest text-white/30 mt-2">
+                              {qualityReport.counts.prompted}/{qualityReport.counts.shots} prompted · {qualityReport.counts.failed} failed · {qualityReport.counts.withStills} stills
+                            </p>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              onClick={handleLockPassport}
+                              className="px-4 py-2 border border-neon/40 text-neon text-[10px] font-black uppercase tracking-widest hover:bg-neon hover:text-black transition-colors"
+                            >
+                              Lock Passport
+                            </button>
+                            <button
+                              onClick={handleExportProductionPacket}
+                              className="px-4 py-2 border border-white/20 text-white/70 text-[10px] font-black uppercase tracking-widest hover:border-neon hover:text-neon transition-colors"
+                            >
+                              Download JSON + EDL
+                            </button>
+                            <button
+                              onClick={() => setShowVerify(false)}
+                              className="px-4 py-2 text-white/40 text-[10px] font-black uppercase tracking-widest hover:text-white"
+                            >
+                              Hide
+                            </button>
+                          </div>
+                        </div>
+                        {passportBlock && (
+                          <pre className="text-[11px] font-mono text-white/70 bg-white/5 p-4 overflow-x-auto whitespace-pre-wrap leading-relaxed">
+                            {passportBlock}
+                          </pre>
+                        )}
+                        {qualityReport.issues.length > 0 && (
+                          <ul className="space-y-2">
+                            {qualityReport.issues.map((issue, idx) => (
+                              <li key={`${issue.code}-${idx}`} className="text-xs font-mono flex gap-3">
+                                <span className={
+                                  issue.severity === 'fail' ? 'text-red-400' : issue.severity === 'warn' ? 'text-amber-300' : 'text-white/40'
+                                }>
+                                  {issue.severity.toUpperCase()}
+                                </span>
+                                <span className="text-white/70">{issue.message}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    )}
 
                     {/* Prompts Section */}
                     {frames.length > 0 && (
