@@ -147,7 +147,7 @@ const App: React.FC = () => {
   // Settings
   const [settings, setSettings] = useState<AppSettings>({
     samplingInterval: 3, // Default 3 seconds
-    xaiModel: 'grok-4.5',
+    xaiModel: 'grok-4.6',
     customInstructions: '',
     promptTemplate: '{{PROMPT}}' // Default template
   });
@@ -1168,7 +1168,7 @@ const App: React.FC = () => {
                             className="w-full bg-transparent border border-white/10 p-4 text-sm text-white/80 focus:border-neon outline-none font-mono"
                             value={settings.xaiModel}
                             onChange={(e) => setSettings({ ...settings, xaiModel: e.target.value })}
-                            placeholder="grok-4.5"
+                            placeholder="grok-4.6"
                           />
                           <p className="text-[9px] text-white/30 font-mono uppercase tracking-wider">
                             Must support image understanding for frame analysis

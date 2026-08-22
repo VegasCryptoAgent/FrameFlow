@@ -21,7 +21,35 @@ interface XaiContentPart {
   inline_file?: ScriptFile;
 }
 
-const DEFAULT_TEXT_MODEL = 'grok-4.5';
+const DEFAULT_TEXT_MODEL = 'grok-4.6';
+
+const parseModelJson = (raw: string): any => {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return {};
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // continue
+  }
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) {
+    try {
+      return JSON.parse(fenced[1].trim());
+    } catch {
+      // continue
+    }
+  }
+  const start = trimmed.indexOf('{');
+  const end = trimmed.lastIndexOf('}');
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(trimmed.slice(start, end + 1));
+    } catch {
+      // continue
+    }
+  }
+  return { prompt: trimmed };
+};
 
 const toUserFacingError = (error: any): Error => {
   const raw = String(error?.response?.data?.error || error?.message || '');
@@ -133,7 +161,7 @@ Cover the subject, action, environment, cinematography, lighting, lens/angle, an
     responseSchema: { name: 'frame_analysis', schema: frameAnalysisSchema },
   });
 
-  const parsed = JSON.parse(result.text || '{}');
+  const parsed = parseModelJson(result.text);
   return {
     prompt: parsed.prompt || 'Could not generate prompt.',
     metadata: parsed.metadata || {},
@@ -200,7 +228,7 @@ Update the narrative and every shot prompt to match the feedback. Preserve every
       },
     },
   });
-  const parsed = JSON.parse(result.text || '{}');
+  const parsed = parseModelJson(result.text);
   if (!parsed.refinedScript || !parsed.refinedFrames) throw new Error('Invalid refinement response structure.');
   return parsed;
 };

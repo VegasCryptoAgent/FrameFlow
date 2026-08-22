@@ -29,7 +29,7 @@ Prerequisites: Node.js 20 or newer and an [xAI API key](https://console.x.ai/).
 
    ```dotenv
    XAI_API_KEY=your_xai_api_key
-   XAI_TEXT_MODEL=grok-4.5
+   XAI_TEXT_MODEL=grok-4.6
    XAI_IMAGE_MODEL=grok-imagine-image-quality
    ```
 

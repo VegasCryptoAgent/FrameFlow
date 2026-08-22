@@ -257,7 +257,7 @@ async function startServer() {
       status: "ok",
       provider: "xAI",
       configured: Boolean(process.env.XAI_API_KEY),
-      textModel: process.env.XAI_TEXT_MODEL || 'grok-4.5',
+      textModel: process.env.XAI_TEXT_MODEL || 'grok-4.6',
       imageModel: process.env.XAI_IMAGE_MODEL || 'grok-imagine-image-quality',
     });
   });
@@ -341,12 +341,70 @@ async function startServer() {
   };
 
   const extractResponseText = (response: any): string => {
-    for (const item of [...(response?.output || [])].reverse()) {
-      for (const content of [...(item?.content || [])].reverse()) {
-        if (content?.type === 'output_text' && typeof content.text === 'string') return content.text;
+    const fromContent = (content: any): string => {
+      if (typeof content === 'string' && content.trim()) return content;
+      if (!Array.isArray(content)) return '';
+      return content
+        .map((part: any) => {
+          if (typeof part === 'string') return part;
+          if (typeof part?.text === 'string') return part.text;
+          return '';
+        })
+        .join('')
+        .trim();
+    };
+
+    if (Array.isArray(response?.output)) {
+      for (const item of [...response.output].reverse()) {
+        if (item?.type && item.type !== 'message' && item.type !== 'output_text') continue;
+        const text = fromContent(item?.content) || (typeof item?.text === 'string' ? item.text : '');
+        if (text) return text;
       }
     }
+
+    const chatText = fromContent(response?.choices?.[0]?.message?.content);
+    if (chatText) return chatText;
+    if (typeof response?.output_text === 'string' && response.output_text.trim()) {
+      return response.output_text;
+    }
+    const kinds = Array.isArray(response?.output)
+      ? response.output.map((item: any) => item?.type || typeof item).join(',')
+      : typeof response?.object;
+    console.error('xAI returned no extractable text. output types:', kinds || 'none');
     throw new Error('xAI returned no text output.');
+  };
+
+  const toChatMessages = (input: any, instructions?: string): any[] => {
+    const messages: any[] = [];
+    if (instructions) messages.push({ role: 'system', content: instructions });
+    if (typeof input === 'string') {
+      messages.push({ role: 'user', content: input });
+      return messages;
+    }
+    if (!Array.isArray(input)) return messages;
+    for (const item of input) {
+      const role = item?.role || 'user';
+      if (typeof item?.content === 'string') {
+        messages.push({ role, content: item.content });
+        continue;
+      }
+      if (!Array.isArray(item?.content)) continue;
+      const content = item.content.map((part: any) => {
+        if (part?.type === 'input_text' || part?.type === 'text') {
+          return { type: 'text', text: part.text || '' };
+        }
+        if (part?.type === 'input_image' || part?.type === 'image_url') {
+          const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+          return { type: 'image_url', image_url: { url, detail: part.detail || 'high' } };
+        }
+        if (part?.type === 'input_file' && part.file_id) {
+          return { type: 'file', file: { file_id: part.file_id } };
+        }
+        return part;
+      });
+      messages.push({ role, content });
+    }
+    return messages;
   };
 
   // Server-side xAI gateway. The API key never enters the browser bundle.
@@ -359,10 +417,14 @@ async function startServer() {
       if (action === 'generateText') {
         const prepared = await prepareInputFiles(payload.input);
         uploadedIds.push(...prepared.uploadedIds);
+        const model = payload.model || process.env.XAI_TEXT_MODEL || 'grok-4.6';
         const body: any = {
-          model: payload.model || process.env.XAI_TEXT_MODEL || 'grok-4.5',
+          model,
           input: prepared.input,
           store: false,
+          // Responses API defaults live search to ON, which returns tool/search
+          // items instead of frame analysis text and fails every shot.
+          search_parameters: { mode: 'off' },
         };
         if (payload.instructions) body.instructions = payload.instructions;
         if (typeof payload.temperature === 'number') body.temperature = payload.temperature;
@@ -376,11 +438,41 @@ async function startServer() {
             },
           };
         }
-        const result = await withRetry(() => axios.post(`${XAI_API_BASE_URL}/responses`, body, {
-          headers: xaiHeaders(),
-          timeout: 360000,
-        }));
-        return res.json({ text: extractResponseText(result.data) });
+
+        try {
+          const result = await withRetry(() => axios.post(`${XAI_API_BASE_URL}/responses`, body, {
+            headers: xaiHeaders(),
+            timeout: 180000,
+          }));
+          return res.json({ text: extractResponseText(result.data) });
+        } catch (responsesError: any) {
+          const status = responsesError?.response?.status;
+          const shouldFallback = status === 400 || status === 404 || status === 422
+            || String(responsesError?.message || '').includes('no text output');
+          if (!shouldFallback) throw responsesError;
+
+          console.warn('Responses API failed, falling back to chat/completions:', status || responsesError.message);
+          const chatBody: any = {
+            model,
+            messages: toChatMessages(prepared.input, payload.instructions),
+            temperature: typeof payload.temperature === 'number' ? payload.temperature : 0.4,
+          };
+          if (payload.responseSchema) {
+            chatBody.response_format = {
+              type: 'json_schema',
+              json_schema: {
+                name: payload.responseSchema.name,
+                schema: payload.responseSchema.schema,
+                strict: true,
+              },
+            };
+          }
+          const chatResult = await withRetry(() => axios.post(`${XAI_API_BASE_URL}/chat/completions`, chatBody, {
+            headers: xaiHeaders(),
+            timeout: 180000,
+          }));
+          return res.json({ text: extractResponseText(chatResult.data) });
+        }
       }
 
       if (action === 'generateImage') {
