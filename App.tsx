@@ -275,9 +275,16 @@ const App: React.FC = () => {
 
       // 2. Analyze Frames (Parallel but limited to avoid rate limits if possible)
       const BATCH_SIZE = 1;
+      let providerError: string | null = null;
       console.log(`Starting analysis for ${initialFrames.length} frames (Sequential processing to avoid rate limits)`);
       
       for (let i = 0; i < initialFrames.length; i += BATCH_SIZE) {
+        if (providerError) {
+          setFrames(prev => prev.map(f =>
+            f.isAnalyzing ? { ...f, isAnalyzing: false, error: providerError as string } : f
+          ));
+          break;
+        }
         const batch = initialFrames.slice(i, i + BATCH_SIZE);
         console.log(`Analyzing frame ${i + 1}/${initialFrames.length}...`);
         
@@ -296,6 +303,9 @@ const App: React.FC = () => {
           } catch (error) {
             console.error(`Frame analysis error for frame ${frame.id}:`, error);
             const errorMessage = error instanceof Error ? error.message : 'Failed to analyze';
+            if (/credits are exhausted|spend limit|provider limit|not available right now/i.test(errorMessage)) {
+              providerError = errorMessage;
+            }
             setFrames(prev => prev.map(f => 
               f.id === frame.id 
                 ? { ...f, isAnalyzing: false, error: errorMessage } 
@@ -314,6 +324,7 @@ const App: React.FC = () => {
         }
       }
 
+      if (providerError) setGlobalError(providerError);
       setStatus(AnalysisStatus.COMPLETED);
 
     } catch (error) {

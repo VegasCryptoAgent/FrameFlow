@@ -194,8 +194,17 @@ const publicXaiError = (error: any): { status: number; message: string } => {
     return { status: 503, message: 'AI analysis is not available right now.' };
   }
   if (
+    upstreamStatus === 403
+    || /used all available credits|spending limit|purchase more credits|raise your spending limit/.test(text)
+  ) {
+    return {
+      status: 402,
+      message: 'xAI credits are exhausted. Add credits or raise the spend limit at console.x.ai, then retry analysis.',
+    };
+  }
+  if (
     upstreamStatus === 429
-    || /credit|quota|rate limit|resource.?exhausted|too many requests|insufficient|billing|spend limit/.test(text)
+    || /quota|rate limit|resource.?exhausted|too many requests/.test(text)
   ) {
     return { status: 429, message: 'AI analysis is temporarily unavailable because the provider limit was reached. Try again later.' };
   }

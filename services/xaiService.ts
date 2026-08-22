@@ -61,6 +61,9 @@ const toUserFacingError = (error: any): Error => {
   ) {
     return new Error(raw);
   }
+  if (/credits are exhausted/.test(lower)) {
+    return new Error(raw);
+  }
   if (/credit|quota|rate limit|resource.?exhausted|too many requests|insufficient|billing|spend limit|429/.test(lower)) {
     return new Error('AI analysis is temporarily unavailable because the provider limit was reached. Try again later.');
   }

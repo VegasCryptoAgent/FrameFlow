@@ -37,6 +37,7 @@ export type ShotInventoryRow = {
   palette: string[];
   prompt: string;
   hasError: boolean;
+  error?: string;
   hasGeneratedStill: boolean;
 };
 
@@ -127,6 +128,7 @@ export const buildShotInventory = (frames: FrameData[]): ShotInventoryRow[] =>
     palette: frame.metadata?.palette || [],
     prompt: (frame.prompt || '').trim(),
     hasError: Boolean(frame.error),
+    error: (frame.error || '').trim(),
     hasGeneratedStill: Boolean(frame.generatedImage || frame.remixImage),
   }));
 
@@ -199,12 +201,25 @@ export const buildQualityReport = (
     });
   }
 
+  const providerErrors = inventory
+    .map((row) => row.error || '')
+    .filter((msg) => /credits are exhausted|spend limit|provider limit|not available right now/i.test(msg));
+  if (providerErrors.length && providerErrors.length === inventory.filter((row) => row.hasError).length) {
+    issues.push({
+      severity: 'fail',
+      code: 'PROVIDER_UNAVAILABLE',
+      message: providerErrors[0],
+    });
+  }
+
   for (const row of inventory) {
     if (row.hasError) {
       issues.push({
         severity: 'fail',
         code: 'ANALYSIS_ERROR',
-        message: `Shot ${row.index} at ${row.timecode} failed analysis.`,
+        message: row.error
+          ? `Shot ${row.index} at ${row.timecode}: ${row.error}`
+          : `Shot ${row.index} at ${row.timecode} failed analysis.`,
         frameId: row.frameId,
         timestamp: row.timestamp,
       });
