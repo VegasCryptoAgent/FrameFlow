@@ -418,20 +418,15 @@ async function startServer() {
         const prepared = await prepareInputFiles(payload.input);
         uploadedIds.push(...prepared.uploadedIds);
         const model = payload.model || process.env.XAI_TEXT_MODEL || 'grok-4.6';
-        const body: any = {
+        const chatBody: any = {
           model,
-          input: prepared.input,
-          store: false,
-          // Responses API defaults live search to ON, which returns tool/search
-          // items instead of frame analysis text and fails every shot.
-          search_parameters: { mode: 'off' },
+          messages: toChatMessages(prepared.input, payload.instructions),
+          temperature: typeof payload.temperature === 'number' ? payload.temperature : 0.4,
         };
-        if (payload.instructions) body.instructions = payload.instructions;
-        if (typeof payload.temperature === 'number') body.temperature = payload.temperature;
         if (payload.responseSchema) {
-          body.text = {
-            format: {
-              type: 'json_schema',
+          chatBody.response_format = {
+            type: 'json_schema',
+            json_schema: {
               name: payload.responseSchema.name,
               schema: payload.responseSchema.schema,
               strict: true,
@@ -440,38 +435,24 @@ async function startServer() {
         }
 
         try {
-          const result = await withRetry(() => axios.post(`${XAI_API_BASE_URL}/responses`, body, {
-            headers: xaiHeaders(),
-            timeout: 180000,
-          }));
-          return res.json({ text: extractResponseText(result.data) });
-        } catch (responsesError: any) {
-          const status = responsesError?.response?.status;
-          const shouldFallback = status === 400 || status === 404 || status === 422
-            || String(responsesError?.message || '').includes('no text output');
-          if (!shouldFallback) throw responsesError;
-
-          console.warn('Responses API failed, falling back to chat/completions:', status || responsesError.message);
-          const chatBody: any = {
-            model,
-            messages: toChatMessages(prepared.input, payload.instructions),
-            temperature: typeof payload.temperature === 'number' ? payload.temperature : 0.4,
-          };
-          if (payload.responseSchema) {
-            chatBody.response_format = {
-              type: 'json_schema',
-              json_schema: {
-                name: payload.responseSchema.name,
-                schema: payload.responseSchema.schema,
-                strict: true,
-              },
-            };
-          }
           const chatResult = await withRetry(() => axios.post(`${XAI_API_BASE_URL}/chat/completions`, chatBody, {
             headers: xaiHeaders(),
             timeout: 180000,
           }));
           return res.json({ text: extractResponseText(chatResult.data) });
+        } catch (chatError: any) {
+          const chatStatus = chatError?.response?.status;
+          // If structured output is rejected, retry as plain JSON object.
+          if (chatStatus === 400 && payload.responseSchema) {
+            console.warn('json_schema rejected, retrying chat/completions as json_object');
+            const looseBody = { ...chatBody, response_format: { type: 'json_object' } };
+            const loose = await withRetry(() => axios.post(`${XAI_API_BASE_URL}/chat/completions`, looseBody, {
+              headers: xaiHeaders(),
+              timeout: 180000,
+            }));
+            return res.json({ text: extractResponseText(loose.data) });
+          }
+          throw chatError;
         }
       }
 
