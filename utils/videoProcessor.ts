@@ -1,3 +1,8 @@
+export type ExtractFramesOptions = {
+  /** When set, capture these times instead of a fixed interval (interval remains the fallback). */
+  timestamps?: number[];
+};
+
 /**
  * Extracts frames from a video URL at specified intervals.
  * Implements resilient decoding with retry logic and seek watchdogs to handle long videos.
@@ -5,7 +10,8 @@
 export const extractFramesFromVideo = async (
   videoUrl: string,
   intervalSeconds: number,
-  onProgress: (progress: number) => void
+  onProgress: (progress: number) => void,
+  options?: ExtractFramesOptions
 ): Promise<{ timestamp: number; imageUrl: string }[]> => {
   return new Promise((resolve, reject) => {
     let video = document.createElement('video');
@@ -15,11 +21,16 @@ export const extractFramesFromVideo = async (
     
     // Recovery & Loop state
     let currentTime = 0;
+    let timeIndex = 0;
     let isFinished = false;
     let retryCount = 0;
     const MAX_RETRIES = 5;
     let lastSuccessfulTime = 0;
     let seekTimeout: number | null = null;
+    const requestedTimes = (options?.timestamps || [])
+      .filter((time) => Number.isFinite(time) && time >= 0)
+      .sort((a, b) => a - b);
+    const useRequestedTimes = requestedTimes.length > 0;
 
     // Decoding constraints
     const MAX_DIM = 1280;
@@ -97,6 +108,11 @@ export const extractFramesFromVideo = async (
         
         // Ensure we start from where we left off if this is a recovery
         currentTime = startTime;
+        if (useRequestedTimes) {
+          const nextIdx = requestedTimes.findIndex((time) => time >= startTime - 0.0001);
+          timeIndex = nextIdx >= 0 ? nextIdx : requestedTimes.length;
+          if (timeIndex < requestedTimes.length) currentTime = requestedTimes[timeIndex];
+        }
         seekAndCapture();
       };
 
@@ -134,8 +150,13 @@ export const extractFramesFromVideo = async (
             });
 
             lastSuccessfulTime = currentTime;
-            currentTime += intervalSeconds;
-            
+            if (useRequestedTimes) {
+              timeIndex += 1;
+              currentTime = requestedTimes[timeIndex] ?? video.duration;
+            } else {
+              currentTime += intervalSeconds;
+            }
+
             setTimeout(() => {
                 seekAndCapture();
             }, SEEK_DELAY);
@@ -180,7 +201,10 @@ export const extractFramesFromVideo = async (
         return;
       }
 
-      if (currentTime >= video.duration) {
+      if (
+        currentTime >= video.duration ||
+        (useRequestedTimes && timeIndex >= requestedTimes.length)
+      ) {
         onProgress(100);
         cleanup();
         resolve(frames);

@@ -26,7 +26,8 @@ import {
   ShieldCheck,
   ClipboardList,
   NotebookText,
-  Upload
+  Upload,
+  AudioLines
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -35,7 +36,15 @@ import VideoUploader, { SAMPLE_VIDEOS, proxyVideoUrl } from './components/VideoU
 import FrameCard from './components/FrameCard';
 import StoryboardView from './components/StoryboardView';
 import FootageNotesPanel from './components/FootageNotesPanel';
+import RhythmCuePanel from './components/RhythmCuePanel';
 import { extractFramesFromVideo } from './utils/videoProcessor';
+import {
+  analyzeVideoRhythm,
+  computeSampleTimestamps,
+  parseRhythmMap,
+  rhythmSidecarDownloadName,
+  serializeRhythmMap,
+} from './utils/rhythmMap';
 import {
   buildProductionPacket,
   downloadTextFile,
@@ -64,7 +73,7 @@ import {
   refineRemix,
   checkXaiConfiguration
 } from './services/xaiService';
-import { FrameData, AnalysisStatus, AppSettings } from './types';
+import { FrameData, AnalysisStatus, AppSettings, type RhythmMap } from './types';
 
 // Simple ID generator
 const generateId = () => Math.random().toString(36).substring(2, 9);
@@ -131,6 +140,11 @@ const App: React.FC = () => {
   const [showCdafImport, setShowCdafImport] = useState(false);
   const [cdafDraft, setCdafDraft] = useState('');
   const [cdafImportBusy, setCdafImportBusy] = useState(false);
+  const [rhythmMap, setRhythmMap] = useState<RhythmMap | null>(null);
+  const [showRhythmPanel, setShowRhythmPanel] = useState(false);
+  const [rhythmDraft, setRhythmDraft] = useState('');
+  const [rhythmBusy, setRhythmBusy] = useState(false);
+  const [rhythmError, setRhythmError] = useState<string | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
   const cdafFileInputRef = useRef<HTMLInputElement>(null);
 
@@ -193,7 +207,8 @@ const App: React.FC = () => {
     samplingInterval: 3, // Default 3 seconds
     xaiModel: 'grok-4.6',
     customInstructions: '',
-    promptTemplate: '{{PROMPT}}' // Default template
+    promptTemplate: '{{PROMPT}}', // Default template
+    preferBeatAccents: false,
   });
   const [showSettings, setShowSettings] = useState(false);
 
@@ -247,6 +262,10 @@ const App: React.FC = () => {
     setCdafSidecar(null);
     setCdafDraft('');
     setShowCdafImport(false);
+    setRhythmMap(null);
+    setRhythmDraft('');
+    setShowRhythmPanel(false);
+    setRhythmError(null);
     setVideoSha256(undefined);
     setVideoDuration(undefined);
 
@@ -288,6 +307,10 @@ const App: React.FC = () => {
     setCdafSidecar(null);
     setCdafDraft('');
     setShowCdafImport(false);
+    setRhythmMap(null);
+    setRhythmDraft('');
+    setShowRhythmPanel(false);
+    setRhythmError(null);
     setVideoName('');
     setVideoSha256(undefined);
     setVideoDuration(undefined);
@@ -308,11 +331,23 @@ const App: React.FC = () => {
     setShowVerify(false);
 
     try {
+      const durationForSampling = videoDuration ?? rhythmMap?.duration ?? 0;
+      const sampleTimes = computeSampleTimestamps(
+        durationForSampling,
+        settings.samplingInterval,
+        rhythmMap,
+        settings.preferBeatAccents
+      );
+      const useBeatTimes = Boolean(
+        settings.preferBeatAccents && rhythmMap && sampleTimes.length > 0 && durationForSampling > 0
+      );
+
       // 1. Extract Frames
       const extractedFrames = await extractFramesFromVideo(
         videoUrl, 
         settings.samplingInterval,
-        (prog) => setProgress(prog)
+        (prog) => setProgress(prog),
+        useBeatTimes ? { timestamps: sampleTimes } : undefined
       );
 
       if (extractedFrames.length === 0) {
@@ -975,6 +1010,80 @@ const App: React.FC = () => {
     }
   };
 
+  const applyRhythmMap = (map: RhythmMap, notice: string) => {
+    setRhythmMap(map);
+    setRhythmDraft(serializeRhythmMap(map));
+    setRhythmError(null);
+    if (map.duration && (!videoDuration || !Number.isFinite(videoDuration))) {
+      setVideoDuration(map.duration);
+    }
+    showNotice(notice);
+  };
+
+  const handleAnalyzeRhythm = async () => {
+    if (!videoUrl && !videoFile) {
+      showNotice('Load a video before analyzing rhythm.');
+      return;
+    }
+    setRhythmBusy(true);
+    setRhythmError(null);
+    try {
+      const source = videoFile || videoUrl;
+      if (!source) throw new Error('No video source available.');
+      const map = await analyzeVideoRhythm(source, { video: videoName || undefined });
+      applyRhythmMap(
+        map,
+        `Rhythm map ready — ${map.cues.length} cue window${map.cues.length === 1 ? '' : 's'}${map.bpm != null ? ` · ${Math.round(map.bpm)} bpm` : ''}.`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Rhythm analysis failed.';
+      setRhythmError(message);
+      showNotice(message);
+    } finally {
+      setRhythmBusy(false);
+    }
+  };
+
+  const handleExportRhythmMap = () => {
+    if (!rhythmMap) {
+      showNotice('Analyze or import a rhythm map before exporting.');
+      return;
+    }
+    downloadTextFile(
+      rhythmSidecarDownloadName(rhythmMap.video || videoName || 'footage'),
+      serializeRhythmMap(rhythmMap),
+      'application/json'
+    );
+    showNotice(`Exported ${rhythmSidecarDownloadName(rhythmMap.video || videoName || 'footage')}.`);
+  };
+
+  const applyImportedRhythm = (text: string) => {
+    const parsed = parseRhythmMap(text);
+    if (parsed.ok === false) {
+      setRhythmError(parsed.error);
+      showNotice(parsed.error);
+      return;
+    }
+    applyRhythmMap(
+      parsed.map,
+      `Imported rhythm cues (${parsed.map.cues.length} windows). Analyze will reuse this timing.`
+    );
+  };
+
+  const handleRhythmFile = async (file: File) => {
+    setRhythmBusy(true);
+    try {
+      const text = await file.text();
+      setRhythmDraft(text);
+      applyImportedRhythm(text);
+    } catch {
+      setRhythmError('Could not read that rhythm map file.');
+      showNotice('Could not read that rhythm map file.');
+    } finally {
+      setRhythmBusy(false);
+    }
+  };
+
   const handleLockPassport = () => {
     const packet = runVerifyPass(frames);
     const block = packet.passport.lockedBlock;
@@ -1313,6 +1422,17 @@ const App: React.FC = () => {
                             />
                             <span className="text-2xl font-black font-display text-white w-16">{settings.samplingInterval}s</span>
                           </div>
+                          <label className="flex items-center gap-3 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={settings.preferBeatAccents}
+                              onChange={(e) => setSettings({ ...settings, preferBeatAccents: e.target.checked })}
+                              className="accent-neon w-4 h-4"
+                            />
+                            <span className="text-[10px] font-black uppercase tracking-widest text-white/60">
+                              Prefer beat accents when sampling
+                            </span>
+                          </label>
                         </div>
 
                         <div className="space-y-4">
@@ -1531,6 +1651,12 @@ const App: React.FC = () => {
                               <Upload className="w-4 h-4" /> Import Notes
                             </button>
                             <button
+                              onClick={() => setShowRhythmPanel((open) => !open)}
+                              className="flex items-center gap-2 px-5 py-4 border border-white/10 text-white font-black uppercase tracking-tighter hover:bg-white/5 transition-colors"
+                            >
+                              <AudioLines className="w-4 h-4" /> Rhythm Map
+                            </button>
+                            <button
                               onClick={handleReset}
                               className="p-4 text-white/40 hover:text-red-500 transition-colors border border-white/10 hover:border-red-500/30"
                               title="Clear video and go back"
@@ -1605,6 +1731,13 @@ const App: React.FC = () => {
                               <Upload className="w-4 h-4" />
                               Import Notes
                             </button>
+                            <button
+                              onClick={() => setShowRhythmPanel((open) => !open)}
+                              className="flex items-center gap-3 px-6 py-4 border border-white/10 text-white font-black uppercase tracking-tighter hover:bg-white/5 transition-colors"
+                            >
+                              <AudioLines className="w-4 h-4" />
+                              Rhythm Map
+                            </button>
                              <button
                                onClick={handleReset}
                                className="p-4 text-white/40 hover:text-red-500 transition-colors"
@@ -1623,6 +1756,14 @@ const App: React.FC = () => {
                       </p>
                     )}
 
+                    {rhythmMap && (
+                      <p className="text-[10px] font-mono uppercase tracking-widest text-neon/70 text-center">
+                        Rhythm map ready — {rhythmMap.cues.length} cue windows
+                        {rhythmMap.bpm != null ? ` · ${Math.round(rhythmMap.bpm)} bpm` : ''}
+                        {settings.preferBeatAccents ? ' · beat-accent sampling on' : ''}.
+                      </p>
+                    )}
+
                     {showCdafImport && (
                       <FootageNotesPanel
                         fileInputRef={cdafFileInputRef}
@@ -1637,9 +1778,28 @@ const App: React.FC = () => {
                       />
                     )}
 
+                    {showRhythmPanel && (
+                      <RhythmCuePanel
+                        map={rhythmMap}
+                        busy={rhythmBusy}
+                        error={rhythmError}
+                        draft={rhythmDraft}
+                        preferBeatAccents={settings.preferBeatAccents}
+                        canAnalyze={Boolean(videoUrl || videoFile)}
+                        onDraftChange={setRhythmDraft}
+                        onPreferBeatAccents={(value) => setSettings({ ...settings, preferBeatAccents: value })}
+                        onAnalyze={handleAnalyzeRhythm}
+                        onExport={handleExportRhythmMap}
+                        onImportFile={handleRhythmFile}
+                        onApplyImport={() => applyImportedRhythm(rhythmDraft)}
+                        onClose={() => setShowRhythmPanel(false)}
+                      />
+                    )}
+
                     <p className="text-[10px] font-mono text-white/30 uppercase tracking-widest text-center leading-relaxed max-w-3xl mx-auto">
                       Footage Notes are a plain-text sidecar (header + timestamped shot notes) you can export next to the video
                       and import later so FrameFlow does not burn vision tokens on the same clip.
+                      Rhythm Cue Map is a local Web Audio sidecar (inspired by BeatScope's cue-map idea, MIT; original FrameFlow implementation).
                     </p>
 
                     {showVerify && qualityReport && (
