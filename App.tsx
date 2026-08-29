@@ -24,7 +24,9 @@ import {
   Maximize2,
   Terminal,
   ShieldCheck,
-  ClipboardList
+  ClipboardList,
+  NotebookText,
+  Upload
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -32,6 +34,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import VideoUploader, { SAMPLE_VIDEOS, proxyVideoUrl } from './components/VideoUploader';
 import FrameCard from './components/FrameCard';
 import StoryboardView from './components/StoryboardView';
+import FootageNotesPanel from './components/FootageNotesPanel';
 import { extractFramesFromVideo } from './utils/videoProcessor';
 import {
   buildProductionPacket,
@@ -39,6 +42,18 @@ import {
   packetToMarkdown,
   type QualityReport,
 } from './utils/productionPacket';
+import {
+  applyCdafToFrames,
+  buildCdafFromFrames,
+  findCdafSegment,
+  hashVideoBytes,
+  matchCdafToVideo,
+  parseCdafSidecar,
+  serializeCdafSidecar,
+  sidecarDownloadName,
+  videoBasenameFromUrl,
+  type CdafSidecar,
+} from './utils/cdafSidecar';
 import { 
   generateFramePrompt, 
   generateImage, 
@@ -109,12 +124,41 @@ const App: React.FC = () => {
   const [qualityReport, setQualityReport] = useState<QualityReport | null>(null);
   const [showVerify, setShowVerify] = useState(false);
   const [passportBlock, setPassportBlock] = useState<string | null>(null);
+  const [videoName, setVideoName] = useState('');
+  const [videoSha256, setVideoSha256] = useState<string | undefined>();
+  const [videoDuration, setVideoDuration] = useState<number | undefined>();
+  const [cdafSidecar, setCdafSidecar] = useState<CdafSidecar | null>(null);
+  const [showCdafImport, setShowCdafImport] = useState(false);
+  const [cdafDraft, setCdafDraft] = useState('');
+  const [cdafImportBusy, setCdafImportBusy] = useState(false);
   const noticeTimerRef = useRef<number | null>(null);
+  const cdafFileInputRef = useRef<HTMLInputElement>(null);
 
   const showNotice = (message: string) => {
     setActionNotice(message);
     if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
     noticeTimerRef.current = window.setTimeout(() => setActionNotice(null), 4500);
+  };
+
+  const videoIdentity = useMemo(
+    () => ({ name: videoName, sha256: videoSha256, duration: videoDuration }),
+    [videoName, videoSha256, videoDuration]
+  );
+
+  const cdafMatch = useMemo(
+    () => (cdafSidecar ? matchCdafToVideo(cdafSidecar, videoIdentity) : null),
+    [cdafSidecar, videoIdentity]
+  );
+
+  const draftCdafMatch = useMemo(() => {
+    if (!cdafDraft.trim()) return cdafMatch;
+    const parsed = parseCdafSidecar(cdafDraft);
+    return parsed.ok ? matchCdafToVideo(parsed.sidecar, videoIdentity) : null;
+  }, [cdafDraft, cdafMatch, videoIdentity]);
+
+  const captureVideoIdentity = (el: HTMLVideoElement) => {
+    const duration = el.duration;
+    if (Number.isFinite(duration) && duration > 0) setVideoDuration(duration);
   };
   
   // Refs
@@ -200,14 +244,24 @@ const App: React.FC = () => {
     setQualityReport(null);
     setShowVerify(false);
     setPassportBlock(null);
+    setCdafSidecar(null);
+    setCdafDraft('');
+    setShowCdafImport(false);
+    setVideoSha256(undefined);
+    setVideoDuration(undefined);
 
     if (file) {
       const objectUrl = URL.createObjectURL(file);
       setVideoUrl(objectUrl);
       setVideoFile(file);
+      setVideoName(file.name);
+      void hashVideoBytes(file).then(setVideoSha256).catch(() => setVideoSha256(undefined));
     } else if (url) {
       setVideoUrl(url);
       setVideoFile(null);
+      setVideoName(videoBasenameFromUrl(url));
+    } else {
+      setVideoName('');
     }
   };
 
@@ -231,13 +285,19 @@ const App: React.FC = () => {
     setQualityReport(null);
     setShowVerify(false);
     setPassportBlock(null);
+    setCdafSidecar(null);
+    setCdafDraft('');
+    setShowCdafImport(false);
+    setVideoName('');
+    setVideoSha256(undefined);
+    setVideoDuration(undefined);
   };
 
   const startAnalysis = async () => {
     if (!videoUrl) return;
 
-    // Ensure we have an API key if needed
-    if (!(await ensureApiKey())) return;
+    const reuseNotes = Boolean(cdafSidecar && cdafMatch?.matched);
+    const coverageTolerance = Math.max(1.25, settings.samplingInterval * 0.75);
 
     setStatus(AnalysisStatus.EXTRACTING);
     setProgress(0);
@@ -259,34 +319,73 @@ const App: React.FC = () => {
         throw new Error("No frames could be extracted from the video. Please try a different video or check the format.");
       }
 
-      // Convert to FrameData structure
-      const initialFrames: FrameData[] = extractedFrames.map(f => ({
-        id: generateId(),
-        timestamp: f.timestamp,
-        imageUrl: f.imageUrl,
-        prompt: null,
-        isAnalyzing: true,
-        error: undefined
-      }));
+      // Convert to FrameData structure; reuse sidecar notes when the clip matches.
+      const initialFrames: FrameData[] = extractedFrames.map(f => {
+        const cached = reuseNotes && cdafSidecar
+          ? findCdafSegment(cdafSidecar, f.timestamp, coverageTolerance)
+          : undefined;
+        if (cached) {
+          return {
+            id: generateId(),
+            timestamp: f.timestamp,
+            imageUrl: f.imageUrl,
+            prompt: cached.notes,
+            metadata: {
+              shotType: cached.shotType,
+              cameraAngle: cached.cameraAngle,
+              lighting: cached.lighting,
+              palette: cached.palette,
+            },
+            isAnalyzing: false,
+          };
+        }
+        return {
+          id: generateId(),
+          timestamp: f.timestamp,
+          imageUrl: f.imageUrl,
+          prompt: null,
+          isAnalyzing: true,
+          error: undefined
+        };
+      });
+
+      const cachedCount = initialFrames.filter(f => f.prompt && !f.isAnalyzing).length;
+      const pending = initialFrames.filter(f => f.isAnalyzing);
 
       setFrames(initialFrames);
       setStatus(AnalysisStatus.ANALYZING);
-      setProgress(0);
+      setProgress(cachedCount > 0 && pending.length === 0 ? 100 : 0);
+
+      if (pending.length === 0) {
+        showNotice(`Reused ${cachedCount} footage-note segment${cachedCount === 1 ? '' : 's'}. Vision analysis skipped.`);
+        setStatus(AnalysisStatus.COMPLETED);
+        return;
+      }
+
+      if (!(await ensureApiKey())) {
+        setFrames(prev => prev.map(f =>
+          f.isAnalyzing
+            ? { ...f, isAnalyzing: false, error: 'Not covered by footage notes. Configure xAI to analyze remaining shots.' }
+            : f
+        ));
+        setStatus(AnalysisStatus.COMPLETED);
+        return;
+      }
 
       // 2. Analyze Frames (Parallel but limited to avoid rate limits if possible)
       const BATCH_SIZE = 1;
       let providerError: string | null = null;
-      console.log(`Starting analysis for ${initialFrames.length} frames (Sequential processing to avoid rate limits)`);
+      console.log(`Starting analysis for ${pending.length} frames (${cachedCount} reused from footage notes)`);
       
-      for (let i = 0; i < initialFrames.length; i += BATCH_SIZE) {
+      for (let i = 0; i < pending.length; i += BATCH_SIZE) {
         if (providerError) {
           setFrames(prev => prev.map(f =>
             f.isAnalyzing ? { ...f, isAnalyzing: false, error: providerError as string } : f
           ));
           break;
         }
-        const batch = initialFrames.slice(i, i + BATCH_SIZE);
-        console.log(`Analyzing frame ${i + 1}/${initialFrames.length}...`);
+        const batch = pending.slice(i, i + BATCH_SIZE);
+        console.log(`Analyzing frame ${i + 1}/${pending.length}...`);
         
         await Promise.all(batch.map(async (frame) => {
           try {
@@ -315,16 +414,19 @@ const App: React.FC = () => {
         }));
 
         // Update progress roughly
-        const currentProgress = Math.round(((i + BATCH_SIZE) / initialFrames.length) * 100);
+        const currentProgress = Math.round(((i + BATCH_SIZE) / pending.length) * 100);
         setProgress(Math.min(100, currentProgress));
 
         // Delay between frames to respect RPM limits
-        if (i + BATCH_SIZE < initialFrames.length) {
+        if (i + BATCH_SIZE < pending.length) {
           await new Promise(resolve => setTimeout(resolve, 2000));
         }
       }
 
       if (providerError) setGlobalError(providerError);
+      if (cachedCount > 0) {
+        showNotice(`Applied ${cachedCount} cached footage-note segment${cachedCount === 1 ? '' : 's'}; analyzed ${pending.length} uncovered shot${pending.length === 1 ? '' : 's'}.`);
+      }
       setStatus(AnalysisStatus.COMPLETED);
 
     } catch (error) {
@@ -818,6 +920,61 @@ const App: React.FC = () => {
       : `Exported packet + EDL with ${packet.report.issues.filter(i => i.severity === 'fail').length} blocking issues.`);
   };
 
+  const handleExportFootageNotes = () => {
+    const prompted = frames.filter(f => (f.prompt || '').trim());
+    if (prompted.length === 0) {
+      showNotice('Analyze or import notes before exporting footage notes.');
+      return;
+    }
+    const sidecar = buildCdafFromFrames(frames, videoIdentity, { storyScript });
+    const parsed = parseCdafSidecar(serializeCdafSidecar(sidecar));
+    if (parsed.ok === false) {
+      showNotice(parsed.error);
+      return;
+    }
+    downloadTextFile(sidecarDownloadName(sidecar.header.video), serializeCdafSidecar(sidecar), 'text/plain;charset=utf-8');
+    showNotice(`Exported footage notes (${sidecar.segments.length} segments) as ${sidecarDownloadName(sidecar.header.video)}.`);
+  };
+
+  const applyImportedText = (text: string, force = false) => {
+    const parsed = parseCdafSidecar(text);
+    if (parsed.ok === false) {
+      showNotice(parsed.error);
+      return;
+    }
+    const match = matchCdafToVideo(parsed.sidecar, videoIdentity);
+    if (!match.matched && !force) {
+      setCdafSidecar(parsed.sidecar);
+      setCdafDraft(text);
+      showNotice(match.reason);
+      return;
+    }
+    setCdafSidecar(parsed.sidecar);
+    setCdafDraft(serializeCdafSidecar(parsed.sidecar));
+    setShowCdafImport(false);
+    if (frames.length === 0) {
+      showNotice(`Footage notes loaded (${parsed.sidecar.segments.length} segments). Deconstruct will reuse covered shots instead of re-analyzing.`);
+      return;
+    }
+    const result = applyCdafToFrames(frames, parsed.sidecar, Math.max(1.25, settings.samplingInterval * 0.75));
+    setFrames(result.frames);
+    setStatus(AnalysisStatus.COMPLETED);
+    showNotice(`Applied footage notes to ${result.applied} segment${result.applied === 1 ? '' : 's'}${result.uncovered ? `; ${result.uncovered} still need vision` : '. Vision skipped for covered shots'}.`);
+  };
+
+  const handleCdafFile = async (file: File) => {
+    setCdafImportBusy(true);
+    try {
+      const text = await file.text();
+      setCdafDraft(text);
+      applyImportedText(text, false);
+    } catch {
+      showNotice('Could not read that footage notes file.');
+    } finally {
+      setCdafImportBusy(false);
+    }
+  };
+
   const handleLockPassport = () => {
     const packet = runVerifyPass(frames);
     const block = packet.passport.lockedBlock;
@@ -1290,7 +1447,9 @@ const App: React.FC = () => {
                           src={videoUrl} 
                           controls 
                           crossOrigin={videoUrl.startsWith('blob:') ? undefined : 'anonymous'}
-                          className="w-full h-full object-contain" 
+                          className="w-full h-full object-contain"
+                          onLoadedMetadata={(e) => captureVideoIdentity(e.currentTarget)}
+                          onDurationChange={(e) => captureVideoIdentity(e.currentTarget)}
                           onError={async (e) => {
                             const mediaError = e.currentTarget.error;
                             const src = e.currentTarget.currentSrc || e.currentTarget.src || videoUrl || '';
@@ -1366,6 +1525,12 @@ const App: React.FC = () => {
                               <Play className="w-5 h-5 fill-current" /> Deconstruct Video
                             </button>
                             <button
+                              onClick={() => setShowCdafImport((open) => !open)}
+                              className="flex items-center gap-2 px-5 py-4 border border-white/10 text-white font-black uppercase tracking-tighter hover:bg-white/5 transition-colors"
+                            >
+                              <Upload className="w-4 h-4" /> Import Notes
+                            </button>
+                            <button
                               onClick={handleReset}
                               className="p-4 text-white/40 hover:text-red-500 transition-colors border border-white/10 hover:border-red-500/30"
                               title="Clear video and go back"
@@ -1426,6 +1591,20 @@ const App: React.FC = () => {
                               <ClipboardList className="w-4 h-4" />
                               Export Packet
                             </button>
+                            <button
+                              onClick={handleExportFootageNotes}
+                              className="flex items-center gap-3 px-6 py-4 border border-neon/40 text-neon font-black uppercase tracking-tighter hover:bg-neon/10 transition-colors"
+                            >
+                              <NotebookText className="w-4 h-4" />
+                              Export Footage Notes
+                            </button>
+                            <button
+                              onClick={() => setShowCdafImport((open) => !open)}
+                              className="flex items-center gap-3 px-6 py-4 border border-white/10 text-white font-black uppercase tracking-tighter hover:bg-white/5 transition-colors"
+                            >
+                              <Upload className="w-4 h-4" />
+                              Import Notes
+                            </button>
                              <button
                                onClick={handleReset}
                                className="p-4 text-white/40 hover:text-red-500 transition-colors"
@@ -1437,6 +1616,31 @@ const App: React.FC = () => {
                       </div>
                       )}
                     </div>
+
+                    {cdafSidecar && cdafMatch?.matched && (
+                      <p className="text-[10px] font-mono uppercase tracking-widest text-neon/70 text-center">
+                        Footage notes ready — {cdafSidecar.segments.length} cached segments. Covered shots skip vision.
+                      </p>
+                    )}
+
+                    {showCdafImport && (
+                      <FootageNotesPanel
+                        fileInputRef={cdafFileInputRef}
+                        draft={cdafDraft}
+                        busy={cdafImportBusy}
+                        match={draftCdafMatch}
+                        loadedSegments={cdafSidecar?.segments.length || 0}
+                        onDraftChange={setCdafDraft}
+                        onFile={handleCdafFile}
+                        onApply={(force) => applyImportedText(cdafDraft, force)}
+                        onClose={() => setShowCdafImport(false)}
+                      />
+                    )}
+
+                    <p className="text-[10px] font-mono text-white/30 uppercase tracking-widest text-center leading-relaxed max-w-3xl mx-auto">
+                      Footage Notes are a plain-text sidecar (header + timestamped shot notes) you can export next to the video
+                      and import later so FrameFlow does not burn vision tokens on the same clip.
+                    </p>
 
                     {showVerify && qualityReport && (
                       <div className="border border-white/10 bg-black/50 p-6 space-y-4 rounded-2xl">
@@ -1463,6 +1667,12 @@ const App: React.FC = () => {
                               className="px-4 py-2 border border-white/20 text-white/70 text-[10px] font-black uppercase tracking-widest hover:border-neon hover:text-neon transition-colors"
                             >
                               Download JSON + EDL
+                            </button>
+                            <button
+                              onClick={handleExportFootageNotes}
+                              className="px-4 py-2 border border-neon/40 text-neon text-[10px] font-black uppercase tracking-widest hover:bg-neon hover:text-black transition-colors"
+                            >
+                              Export Footage Notes
                             </button>
                             <button
                               onClick={() => setShowVerify(false)}
