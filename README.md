@@ -78,3 +78,13 @@ Use **Verify** to reopen the report, **Lock Passport** to stamp it into Config (
 After analysis, **Export Footage Notes** downloads a UTF-8 `.cdaf.txt` file next to the usual packet/storyboard exports. The sidecar is FrameFlow's own CDAF-inspired format (not a vendor of another project): a small header (video basename, SHA-256 of the file bytes when available, duration, generator, created) plus a markdown body (Summary + timestamped Segments with shot notes and metadata).
 
 **Import Footage Notes** (upload or paste) after a video is selected. If the sidecar matches the current clip — exact SHA-256, or a name + duration heuristic — FrameFlow fills prompts from the cached segments and skips Grok vision on those timestamps so the same footage does not burn tokens again. Uncovered shots still use the existing `XAI_API_KEY` analysis path. Keep the `.cdaf.txt` beside the video and re-import it on the next session.
+
+## Rhythm cue map
+
+After a video is loaded, **Rhythm Map** opens a local timing panel (same neon/mono language as Footage Notes). FrameFlow decodes the video's audio track in the browser with the Web Audio API — no Python stack, no extra API keys.
+
+- **Analyze Rhythm** builds a compact `frameflow-rhythm-map-1.0` object: duration, best-effort BPM, beats, multiband onsets (LOW/MID/HIGH), energy samples, and eight-bar-style cue windows labeled `impact` / `scale` / `flow` / `flash` / `bloom` (motion-oriented, not drum transcription).
+- **Export** downloads a `.ffrhythm.json` sidecar. **Import** (upload or paste) applies cues without re-analyzing.
+- **Prefer beat accents when sampling** (Config or the rhythm panel) snaps Deconstruct's frame times toward high-impact onsets when a map is present. The existing sampling interval remains the fallback.
+
+Inspired by BeatScope's cue-map idea (MIT); original FrameFlow implementation. Not a clone of BeatScope's analyzer or visualizer.
