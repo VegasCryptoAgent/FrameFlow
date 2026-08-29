@@ -72,3 +72,9 @@ After frame analysis, FrameFlow runs a local verify pass (no extra API keys) and
 - Shot inventory / EDL — timestamped shot list as `frameflow-packet.json` plus `frameflow-edl.md`
 
 Use **Verify** to reopen the report, **Lock Passport** to stamp it into Config (`{{PASSPORT}}` + directives), and **Export Packet** to download JSON + markdown. Re-run analysis after locking so every prompt carries the same identity block.
+
+## Footage notes sidecar
+
+After analysis, **Export Footage Notes** downloads a UTF-8 `.cdaf.txt` file next to the usual packet/storyboard exports. The sidecar is FrameFlow's own CDAF-inspired format (not a vendor of another project): a small header (video basename, SHA-256 of the file bytes when available, duration, generator, created) plus a markdown body (Summary + timestamped Segments with shot notes and metadata).
+
+**Import Footage Notes** (upload or paste) after a video is selected. If the sidecar matches the current clip — exact SHA-256, or a name + duration heuristic — FrameFlow fills prompts from the cached segments and skips Grok vision on those timestamps so the same footage does not burn tokens again. Uncovered shots still use the existing `XAI_API_KEY` analysis path. Keep the `.cdaf.txt` beside the video and re-import it on the next session.
