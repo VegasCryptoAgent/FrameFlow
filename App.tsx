@@ -1131,7 +1131,7 @@ const App: React.FC = () => {
     setClipHealthReport(report);
     setClipHealthDraft(serializeClipHealthReport(report));
     setClipHealthError(null);
-    if (sourceFrames.length > 0) {
+    if (sourceFrames.length > 0 && (status === AnalysisStatus.COMPLETED || showVerify)) {
       runVerifyPass(sourceFrames, report);
     }
     showNotice(notice);
