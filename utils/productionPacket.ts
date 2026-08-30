@@ -55,6 +55,10 @@ export type QualityReport = {
   };
 };
 
+export type PacketExtras = {
+  healthIssues?: QualityIssue[];
+};
+
 export type ProductionPacket = {
   version: 1;
   app: 'FrameFlow';
@@ -185,7 +189,8 @@ export const buildAssetPassport = (frames: FrameData[]): AssetPassport => {
 
 export const buildQualityReport = (
   frames: FrameData[],
-  samplingIntervalSec = 3
+  samplingIntervalSec = 3,
+  extras?: PacketExtras
 ): QualityReport => {
   const inventory = buildShotInventory(frames);
   const issues: QualityIssue[] = [];
@@ -296,6 +301,16 @@ export const buildQualityReport = (
     });
   }
 
+  for (const healthIssue of extras?.healthIssues || []) {
+    issues.push({
+      severity: healthIssue.severity,
+      code: healthIssue.code,
+      message: healthIssue.message,
+      frameId: healthIssue.frameId,
+      timestamp: healthIssue.timestamp,
+    });
+  }
+
   const fails = issues.filter((issue) => issue.severity === 'fail').length;
   const warns = issues.filter((issue) => issue.severity === 'warn').length;
   const score = Math.max(0, Math.min(100, 100 - fails * 18 - warns * 6));
@@ -324,7 +339,8 @@ export const buildQualityReport = (
 
 export const buildProductionPacket = (
   frames: FrameData[],
-  samplingIntervalSec = 3
+  samplingIntervalSec = 3,
+  extras?: PacketExtras
 ): ProductionPacket => ({
   version: 1,
   app: 'FrameFlow',
@@ -332,7 +348,7 @@ export const buildProductionPacket = (
   samplingIntervalSec,
   passport: buildAssetPassport(frames),
   inventory: buildShotInventory(frames),
-  report: buildQualityReport(frames, samplingIntervalSec),
+  report: buildQualityReport(frames, samplingIntervalSec, extras),
 });
 
 export const packetToMarkdown = (packet: ProductionPacket): string => {

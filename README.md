@@ -88,3 +88,14 @@ After a video is loaded, **Rhythm Map** opens a local timing panel (same neon/mo
 - **Prefer beat accents when sampling** (Config or the rhythm panel) snaps Deconstruct's frame times toward high-impact onsets when a map is present. The existing sampling interval remains the fallback.
 
 Inspired by BeatScope's cue-map idea (MIT); original FrameFlow implementation. Not a clone of BeatScope's analyzer or visualizer.
+
+## Clip health / motion health
+
+After frames are sampled, **Clip Health** (next to Rhythm Map / Verify / Export Packet / Footage Notes) grades physical footage health from consecutive stills — no extra API key, no vision model.
+
+- **Analyze Health** downscales extracted frames to a small grayscale canvas, measures mean-absolute luma difference between neighbors, then classifies `OK` / `STATIC` (near-zero motion) / `JITTER` (high variance / thrash) / `MORPH` (a sudden spike after a stable run). If no frames exist yet, it samples first using the current interval.
+- **Export** downloads a versioned `.ffhealth.json` sidecar (video name, sampled timestamps, motion series, verdict, summary). **Import** (upload or paste) reloads it.
+- Findings fold into the existing Verify pass and production packet as extra `QualityIssue` rows (`STATIC`, `JITTER`, `MORPH`) when a health report exists. They do not replace shot-prompt continuity checks.
+- `POST /api/clip-health` accepts `{ samples: [{ timestamp, motion }, ...] }` or `{ diffs: number[] }` and returns `{ ok, verdict, mean, variance, issues, summary }`. Pure JSON — no ffmpeg. `GET /api/health` is unchanged.
+
+Motion-health idea inspired by AIVideoAdherenceGate (MIT); original FrameFlow implementation. Not a clone of that project's Python CLI or source.

@@ -105,3 +105,45 @@ export interface RhythmMap {
   video?: string;
   created?: string;
 }
+
+export const CLIP_HEALTH_SCHEMA_VERSION = 'frameflow-clip-health-1.0' as const;
+
+export const CLIP_HEALTH_ATTRIBUTION =
+  'motion-health idea inspired by AIVideoAdherenceGate (MIT); original FrameFlow implementation';
+
+/** Pixel-motion verdict from consecutive sampled frames. Not a vision-model grade. */
+export type ClipHealthVerdict = 'OK' | 'STATIC' | 'JITTER' | 'MORPH';
+
+export type ClipHealthSeverity = 'fail' | 'warn' | 'info';
+
+export interface ClipHealthSample {
+  timestamp: number;
+  motion: number;
+}
+
+export interface ClipHealthIssue {
+  code: string;
+  severity: ClipHealthSeverity;
+  message: string;
+  timestamp?: number;
+}
+
+/**
+ * Versioned motion-health sidecar produced from sampled frames.
+ * schema_version: frameflow-clip-health-1.0
+ *
+ * Motion-health idea inspired by AIVideoAdherenceGate (MIT); original FrameFlow implementation.
+ */
+export interface ClipHealthReport {
+  schema_version: typeof CLIP_HEALTH_SCHEMA_VERSION;
+  attribution: string;
+  video?: string;
+  created?: string;
+  verdict: ClipHealthVerdict;
+  mean: number;
+  variance: number;
+  summary: string;
+  timestamps: number[];
+  samples: ClipHealthSample[];
+  issues: ClipHealthIssue[];
+}

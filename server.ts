@@ -7,6 +7,7 @@ import PDFDocument from "pdfkit";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Readable } from "node:stream";
+import { scoreClipHealth } from "./utils/clipHealth";
 
 const XAI_API_BASE_URL = 'https://api.x.ai/v1';
 const execFileAsync = promisify(execFile);
@@ -269,6 +270,21 @@ async function startServer() {
       textModel: process.env.XAI_TEXT_MODEL || 'grok-4.6',
       imageModel: process.env.XAI_IMAGE_MODEL || 'grok-imagine-image-quality',
     });
+  });
+
+  // Pure JSON motion-health smoke path. No ffmpeg, no vision model.
+  // Motion-health idea inspired by AIVideoAdherenceGate (MIT); original FrameFlow implementation.
+  app.post("/api/clip-health", (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const hasSamples = Array.isArray(body.samples) && body.samples.length > 0;
+    const hasDiffs = Array.isArray(body.diffs) && body.diffs.length > 0;
+    if (!hasSamples && !hasDiffs) {
+      res.status(400).json({
+        error: 'Send { samples: [{ timestamp, motion }, ...] } or { diffs: number[] }.',
+      });
+      return;
+    }
+    res.json(scoreClipHealth(body));
   });
 
   // Helper for retries with jitter and more attempts for rate limits
