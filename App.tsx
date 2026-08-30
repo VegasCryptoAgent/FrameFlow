@@ -27,7 +27,8 @@ import {
   ClipboardList,
   NotebookText,
   Upload,
-  AudioLines
+  AudioLines,
+  HeartPulse
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -37,6 +38,7 @@ import FrameCard from './components/FrameCard';
 import StoryboardView from './components/StoryboardView';
 import FootageNotesPanel from './components/FootageNotesPanel';
 import RhythmCuePanel from './components/RhythmCuePanel';
+import ClipHealthPanel from './components/ClipHealthPanel';
 import { extractFramesFromVideo } from './utils/videoProcessor';
 import {
   analyzeVideoRhythm,
@@ -46,9 +48,18 @@ import {
   serializeRhythmMap,
 } from './utils/rhythmMap';
 import {
+  analyzeClipHealthFromFrames,
+  clipHealthSidecarDownloadName,
+  parseClipHealthReport,
+  postClipHealth,
+  reportFromApi,
+  serializeClipHealthReport,
+} from './utils/clipHealth';
+import {
   buildProductionPacket,
   downloadTextFile,
   packetToMarkdown,
+  type QualityIssue,
   type QualityReport,
 } from './utils/productionPacket';
 import {
@@ -73,10 +84,18 @@ import {
   refineRemix,
   checkXaiConfiguration
 } from './services/xaiService';
-import { FrameData, AnalysisStatus, AppSettings, type RhythmMap } from './types';
+import { FrameData, AnalysisStatus, AppSettings, type ClipHealthReport, type RhythmMap } from './types';
 
 // Simple ID generator
 const generateId = () => Math.random().toString(36).substring(2, 9);
+
+const healthIssuesFromReport = (report: ClipHealthReport | null): QualityIssue[] =>
+  (report?.issues || []).map((issue) => ({
+    severity: issue.severity,
+    code: issue.code,
+    message: issue.message,
+    timestamp: issue.timestamp,
+  }));
 
 type SortOption = 'time-asc' | 'time-desc' | 'prompt-asc' | 'prompt-desc';
 
@@ -145,6 +164,11 @@ const App: React.FC = () => {
   const [rhythmDraft, setRhythmDraft] = useState('');
   const [rhythmBusy, setRhythmBusy] = useState(false);
   const [rhythmError, setRhythmError] = useState<string | null>(null);
+  const [clipHealthReport, setClipHealthReport] = useState<ClipHealthReport | null>(null);
+  const [showClipHealthPanel, setShowClipHealthPanel] = useState(false);
+  const [clipHealthDraft, setClipHealthDraft] = useState('');
+  const [clipHealthBusy, setClipHealthBusy] = useState(false);
+  const [clipHealthError, setClipHealthError] = useState<string | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
   const cdafFileInputRef = useRef<HTMLInputElement>(null);
 
@@ -215,11 +239,13 @@ const App: React.FC = () => {
   useEffect(() => {
     if (status !== AnalysisStatus.COMPLETED || frames.length === 0) return;
     if (frames.some((frame) => frame.isAnalyzing)) return;
-    const packet = buildProductionPacket(frames, settings.samplingInterval);
+    const packet = buildProductionPacket(frames, settings.samplingInterval, {
+      healthIssues: healthIssuesFromReport(clipHealthReport),
+    });
     setQualityReport(packet.report);
     setPassportBlock(packet.passport.lockedBlock);
     setShowVerify(true);
-  }, [status, frames, settings.samplingInterval]);
+  }, [status, frames, settings.samplingInterval, clipHealthReport]);
   const [suggestionState, setSuggestionState] = useState<{
     show: boolean;
     x: number;
@@ -266,6 +292,10 @@ const App: React.FC = () => {
     setRhythmDraft('');
     setShowRhythmPanel(false);
     setRhythmError(null);
+    setClipHealthReport(null);
+    setClipHealthDraft('');
+    setShowClipHealthPanel(false);
+    setClipHealthError(null);
     setVideoSha256(undefined);
     setVideoDuration(undefined);
 
@@ -311,6 +341,10 @@ const App: React.FC = () => {
     setRhythmDraft('');
     setShowRhythmPanel(false);
     setRhythmError(null);
+    setClipHealthReport(null);
+    setClipHealthDraft('');
+    setShowClipHealthPanel(false);
+    setClipHealthError(null);
     setVideoName('');
     setVideoSha256(undefined);
     setVideoDuration(undefined);
@@ -471,8 +505,13 @@ const App: React.FC = () => {
     }
   };
 
-  const runVerifyPass = (sourceFrames: FrameData[] = frames) => {
-    const packet = buildProductionPacket(sourceFrames, settings.samplingInterval);
+  const runVerifyPass = (
+    sourceFrames: FrameData[] = frames,
+    health: ClipHealthReport | null = clipHealthReport
+  ) => {
+    const packet = buildProductionPacket(sourceFrames, settings.samplingInterval, {
+      healthIssues: healthIssuesFromReport(health),
+    });
     setQualityReport(packet.report);
     setPassportBlock(packet.passport.lockedBlock);
     setShowVerify(true);
@@ -1084,6 +1123,114 @@ const App: React.FC = () => {
     }
   };
 
+  const applyClipHealthReport = (
+    report: ClipHealthReport,
+    notice: string,
+    sourceFrames: FrameData[] = frames
+  ) => {
+    setClipHealthReport(report);
+    setClipHealthDraft(serializeClipHealthReport(report));
+    setClipHealthError(null);
+    if (sourceFrames.length > 0 && (status === AnalysisStatus.COMPLETED || showVerify)) {
+      runVerifyPass(sourceFrames, report);
+    }
+    showNotice(notice);
+  };
+
+  const handleAnalyzeClipHealth = async () => {
+    if (!videoUrl && frames.length < 2) {
+      showNotice('Load a video or extract frames before analyzing clip health.');
+      return;
+    }
+    setClipHealthBusy(true);
+    setClipHealthError(null);
+    try {
+      let sourceFrames = frames;
+      if (sourceFrames.length < 2 && videoUrl) {
+        showNotice('Sampling frames for clip health…');
+        const extracted = await extractFramesFromVideo(
+          videoUrl,
+          settings.samplingInterval,
+          () => undefined
+        );
+        sourceFrames = extracted.map((frame) => ({
+          id: generateId(),
+          timestamp: frame.timestamp,
+          imageUrl: frame.imageUrl,
+          prompt: null,
+          isAnalyzing: false,
+        }));
+        setFrames(sourceFrames);
+      }
+      if (sourceFrames.length < 2) {
+        throw new Error('Need at least two sampled frames to measure motion.');
+      }
+
+      const local = await analyzeClipHealthFromFrames(sourceFrames, { video: videoName || undefined });
+      let api;
+      try {
+        api = await postClipHealth({ samples: local.samples });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Clip health API failed.';
+        setClipHealthError(message);
+        applyClipHealthReport(local, `${local.verdict} — ${local.summary} (local fallback)`, sourceFrames);
+        return;
+      }
+      const report = reportFromApi(api, {
+        samples: local.samples,
+        frameTimes: local.timestamps,
+        video: videoName || undefined,
+      });
+      applyClipHealthReport(report, `${report.verdict} — ${report.summary}`, sourceFrames);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Clip health analysis failed.';
+      setClipHealthError(message);
+      showNotice(message);
+    } finally {
+      setClipHealthBusy(false);
+    }
+  };
+
+  const handleExportClipHealth = () => {
+    if (!clipHealthReport) {
+      showNotice('Analyze or import clip health before exporting.');
+      return;
+    }
+    downloadTextFile(
+      clipHealthSidecarDownloadName(clipHealthReport.video || videoName || 'footage'),
+      serializeClipHealthReport(clipHealthReport),
+      'application/json'
+    );
+    showNotice(`Exported ${clipHealthSidecarDownloadName(clipHealthReport.video || videoName || 'footage')}.`);
+  };
+
+  const applyImportedClipHealth = (text: string) => {
+    const parsed = parseClipHealthReport(text);
+    if (parsed.ok === false) {
+      setClipHealthError(parsed.error);
+      showNotice(parsed.error);
+      return;
+    }
+    applyClipHealthReport(
+      parsed.report,
+      `Imported clip health (${parsed.report.verdict}). Verify will include this motion gate.`
+    );
+  };
+
+  const handleClipHealthFile = async (file: File) => {
+    setClipHealthBusy(true);
+    try {
+      const text = await file.text();
+      setClipHealthDraft(text);
+      applyImportedClipHealth(text);
+    } catch {
+      setClipHealthError('Could not read that clip health file.');
+      showNotice('Could not read that clip health file.');
+    } finally {
+      setClipHealthBusy(false);
+    }
+  };
+
   const handleLockPassport = () => {
     const packet = runVerifyPass(frames);
     const block = packet.passport.lockedBlock;
@@ -1657,6 +1804,12 @@ const App: React.FC = () => {
                               <AudioLines className="w-4 h-4" /> Rhythm Map
                             </button>
                             <button
+                              onClick={() => setShowClipHealthPanel((open) => !open)}
+                              className="flex items-center gap-2 px-5 py-4 border border-white/10 text-white font-black uppercase tracking-tighter hover:bg-white/5 transition-colors"
+                            >
+                              <HeartPulse className="w-4 h-4" /> Clip Health
+                            </button>
+                            <button
                               onClick={handleReset}
                               className="p-4 text-white/40 hover:text-red-500 transition-colors border border-white/10 hover:border-red-500/30"
                               title="Clear video and go back"
@@ -1738,6 +1891,14 @@ const App: React.FC = () => {
                               <AudioLines className="w-4 h-4" />
                               Rhythm Map
                             </button>
+                            <button
+                              id="clip-health-control-tools"
+                              onClick={() => setShowClipHealthPanel((open) => !open)}
+                              className="flex items-center gap-3 px-6 py-4 border border-white/10 text-white font-black uppercase tracking-tighter hover:bg-white/5 transition-colors"
+                            >
+                              <HeartPulse className="w-4 h-4" />
+                              Clip Health
+                            </button>
                              <button
                                onClick={handleReset}
                                className="p-4 text-white/40 hover:text-red-500 transition-colors"
@@ -1761,6 +1922,13 @@ const App: React.FC = () => {
                         Rhythm map ready — {rhythmMap.cues.length} cue windows
                         {rhythmMap.bpm != null ? ` · ${Math.round(rhythmMap.bpm)} bpm` : ''}
                         {settings.preferBeatAccents ? ' · beat-accent sampling on' : ''}.
+                      </p>
+                    )}
+
+                    {clipHealthReport && (
+                      <p className="text-[10px] font-mono uppercase tracking-widest text-neon/70 text-center">
+                        Clip health ready — {clipHealthReport.verdict}
+                        {clipHealthReport.verdict !== 'OK' ? ` · ${clipHealthReport.summary}` : ' · motion in a healthy mid range'}.
                       </p>
                     )}
 
@@ -1796,10 +1964,27 @@ const App: React.FC = () => {
                       />
                     )}
 
+                    {showClipHealthPanel && (
+                      <ClipHealthPanel
+                        report={clipHealthReport}
+                        busy={clipHealthBusy}
+                        error={clipHealthError}
+                        draft={clipHealthDraft}
+                        canAnalyze={Boolean(videoUrl || videoFile || frames.length >= 2)}
+                        onDraftChange={setClipHealthDraft}
+                        onAnalyze={handleAnalyzeClipHealth}
+                        onExport={handleExportClipHealth}
+                        onImportFile={handleClipHealthFile}
+                        onApplyImport={() => applyImportedClipHealth(clipHealthDraft)}
+                        onClose={() => setShowClipHealthPanel(false)}
+                      />
+                    )}
+
                     <p className="text-[10px] font-mono text-white/30 uppercase tracking-widest text-center leading-relaxed max-w-3xl mx-auto">
                       Footage Notes are a plain-text sidecar (header + timestamped shot notes) you can export next to the video
                       and import later so FrameFlow does not burn vision tokens on the same clip.
                       Rhythm Cue Map is a local Web Audio sidecar (inspired by BeatScope's cue-map idea, MIT; original FrameFlow implementation).
+                      Clip Health / Motion Health is a local consecutive-frame luma-diff gate (inspired by AIVideoAdherenceGate, MIT; original FrameFlow implementation).
                     </p>
 
                     {showVerify && qualityReport && (
