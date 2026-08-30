@@ -111,6 +111,50 @@ export const CLIP_HEALTH_SCHEMA_VERSION = 'frameflow-clip-health-1.0' as const;
 export const CLIP_HEALTH_ATTRIBUTION =
   'motion-health idea inspired by AIVideoAdherenceGate (MIT); original FrameFlow implementation';
 
+export const PLATFORM_FIT_SCHEMA_VERSION = 'frameflow-platform-fit-1.0' as const;
+
+export const PLATFORM_FIT_ATTRIBUTION =
+  'platform-fit idea inspired by ShortsMCP (MIT); original FrameFlow implementation';
+
+/** Ship-readiness grade from duration + frame size. Not a vendor platform table. */
+export type PlatformFitStatus = 'GO' | 'WARN' | 'NO-GO';
+
+export type PlatformFitAspect = '9:16' | '16:9' | '1:1' | 'other';
+
+export type PlatformFitId =
+  | 'youtube_shorts'
+  | 'tiktok'
+  | 'instagram_reels'
+  | 'facebook_reels'
+  | 'twitter_x'
+  | 'linkedin';
+
+export interface PlatformFitRow {
+  id: PlatformFitId;
+  status: PlatformFitStatus;
+  want: '9:16' | '16:9';
+  minSec: number;
+  maxSec: number;
+  title: string;
+  caption: string;
+  issues: string[];
+}
+
+/**
+ * Versioned platform-fit grade from known width / height / duration.
+ * schema_version: frameflow-platform-fit-1.0
+ *
+ * Platform-fit idea inspired by ShortsMCP (MIT); original FrameFlow implementation.
+ */
+export interface PlatformFitReport {
+  ok: boolean;
+  source: typeof PLATFORM_FIT_SCHEMA_VERSION;
+  vertical: boolean;
+  aspect: PlatformFitAspect;
+  durationSeconds: number | null;
+  platforms: PlatformFitRow[];
+}
+
 /** Pixel-motion verdict from consecutive sampled frames. Not a vision-model grade. */
 export type ClipHealthVerdict = 'OK' | 'STATIC' | 'JITTER' | 'MORPH';
 
