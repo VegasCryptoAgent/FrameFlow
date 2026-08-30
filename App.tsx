@@ -28,7 +28,8 @@ import {
   NotebookText,
   Upload,
   AudioLines,
-  HeartPulse
+  HeartPulse,
+  Share2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -39,6 +40,7 @@ import StoryboardView from './components/StoryboardView';
 import FootageNotesPanel from './components/FootageNotesPanel';
 import RhythmCuePanel from './components/RhythmCuePanel';
 import ClipHealthPanel from './components/ClipHealthPanel';
+import PlatformFitPanel from './components/PlatformFitPanel';
 import { extractFramesFromVideo } from './utils/videoProcessor';
 import {
   analyzeVideoRhythm,
@@ -55,6 +57,7 @@ import {
   reportFromApi,
   serializeClipHealthReport,
 } from './utils/clipHealth';
+import { classifyAspect, postPlatformFit } from './utils/platformFit';
 import {
   buildProductionPacket,
   downloadTextFile,
@@ -84,7 +87,7 @@ import {
   refineRemix,
   checkXaiConfiguration
 } from './services/xaiService';
-import { FrameData, AnalysisStatus, AppSettings, type ClipHealthReport, type RhythmMap } from './types';
+import { FrameData, AnalysisStatus, AppSettings, type ClipHealthReport, type PlatformFitReport, type RhythmMap } from './types';
 
 // Simple ID generator
 const generateId = () => Math.random().toString(36).substring(2, 9);
@@ -155,6 +158,8 @@ const App: React.FC = () => {
   const [videoName, setVideoName] = useState('');
   const [videoSha256, setVideoSha256] = useState<string | undefined>();
   const [videoDuration, setVideoDuration] = useState<number | undefined>();
+  const [videoWidth, setVideoWidth] = useState<number | undefined>();
+  const [videoHeight, setVideoHeight] = useState<number | undefined>();
   const [cdafSidecar, setCdafSidecar] = useState<CdafSidecar | null>(null);
   const [showCdafImport, setShowCdafImport] = useState(false);
   const [cdafDraft, setCdafDraft] = useState('');
@@ -169,6 +174,11 @@ const App: React.FC = () => {
   const [clipHealthDraft, setClipHealthDraft] = useState('');
   const [clipHealthBusy, setClipHealthBusy] = useState(false);
   const [clipHealthError, setClipHealthError] = useState<string | null>(null);
+  const [platformFitReport, setPlatformFitReport] = useState<PlatformFitReport | null>(null);
+  const [showPlatformFitPanel, setShowPlatformFitPanel] = useState(false);
+  const [platformFitTitle, setPlatformFitTitle] = useState('');
+  const [platformFitBusy, setPlatformFitBusy] = useState(false);
+  const [platformFitError, setPlatformFitError] = useState<string | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
   const cdafFileInputRef = useRef<HTMLInputElement>(null);
 
@@ -197,6 +207,8 @@ const App: React.FC = () => {
   const captureVideoIdentity = (el: HTMLVideoElement) => {
     const duration = el.duration;
     if (Number.isFinite(duration) && duration > 0) setVideoDuration(duration);
+    if (el.videoWidth > 0) setVideoWidth(el.videoWidth);
+    if (el.videoHeight > 0) setVideoHeight(el.videoHeight);
   };
   
   // Refs
@@ -296,8 +308,14 @@ const App: React.FC = () => {
     setClipHealthDraft('');
     setShowClipHealthPanel(false);
     setClipHealthError(null);
+    setPlatformFitReport(null);
+    setPlatformFitTitle('');
+    setShowPlatformFitPanel(false);
+    setPlatformFitError(null);
     setVideoSha256(undefined);
     setVideoDuration(undefined);
+    setVideoWidth(undefined);
+    setVideoHeight(undefined);
 
     if (file) {
       const objectUrl = URL.createObjectURL(file);
@@ -345,9 +363,15 @@ const App: React.FC = () => {
     setClipHealthDraft('');
     setShowClipHealthPanel(false);
     setClipHealthError(null);
+    setPlatformFitReport(null);
+    setPlatformFitTitle('');
+    setShowPlatformFitPanel(false);
+    setPlatformFitError(null);
     setVideoName('');
     setVideoSha256(undefined);
     setVideoDuration(undefined);
+    setVideoWidth(undefined);
+    setVideoHeight(undefined);
   };
 
   const startAnalysis = async () => {
@@ -1231,6 +1255,57 @@ const App: React.FC = () => {
     }
   };
 
+  const readFrameSize = (imageUrl: string): Promise<{ width: number; height: number } | null> =>
+    new Promise((resolve) => {
+      const image = new Image();
+      image.onload = () => {
+        resolve(
+          image.naturalWidth > 0 && image.naturalHeight > 0
+            ? { width: image.naturalWidth, height: image.naturalHeight }
+            : null
+        );
+      };
+      image.onerror = () => resolve(null);
+      image.src = imageUrl;
+    });
+
+  const handleGradePlatformFit = async () => {
+    setPlatformFitBusy(true);
+    setPlatformFitError(null);
+    try {
+      let width = videoWidth;
+      let height = videoHeight;
+      if (!(width && height)) {
+        const first = frames.find((frame) => frame.imageUrl);
+        const fromFrame = first ? await readFrameSize(first.imageUrl) : null;
+        width = fromFrame?.width;
+        height = fromFrame?.height;
+        if (width) setVideoWidth(width);
+        if (height) setVideoHeight(height);
+      }
+      if (!(width && height)) {
+        throw new Error('Need a sampled clip size (width × height) before grading platforms.');
+      }
+      const report = await postPlatformFit({
+        width,
+        height,
+        durationSeconds: videoDuration ?? null,
+        title: platformFitTitle.trim() || undefined,
+      });
+      setPlatformFitReport(report);
+      const go = report.platforms.filter((row) => row.status === 'GO').length;
+      const warn = report.platforms.filter((row) => row.status === 'WARN').length;
+      const nogo = report.platforms.filter((row) => row.status === 'NO-GO').length;
+      showNotice(`Platform fit — ${go} GO · ${warn} WARN · ${nogo} NO-GO.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Platform fit failed.';
+      setPlatformFitError(message);
+      showNotice(message);
+    } finally {
+      setPlatformFitBusy(false);
+    }
+  };
+
   const handleLockPassport = () => {
     const packet = runVerifyPass(frames);
     const block = packet.passport.lockedBlock;
@@ -1810,6 +1885,12 @@ const App: React.FC = () => {
                               <HeartPulse className="w-4 h-4" /> Clip Health
                             </button>
                             <button
+                              onClick={() => setShowPlatformFitPanel((open) => !open)}
+                              className="flex items-center gap-2 px-5 py-4 border border-white/10 text-white font-black uppercase tracking-tighter hover:bg-white/5 transition-colors"
+                            >
+                              <Share2 className="w-4 h-4" /> Platform Fit
+                            </button>
+                            <button
                               onClick={handleReset}
                               className="p-4 text-white/40 hover:text-red-500 transition-colors border border-white/10 hover:border-red-500/30"
                               title="Clear video and go back"
@@ -1899,6 +1980,14 @@ const App: React.FC = () => {
                               <HeartPulse className="w-4 h-4" />
                               Clip Health
                             </button>
+                            <button
+                              id="platform-fit-control-tools"
+                              onClick={() => setShowPlatformFitPanel((open) => !open)}
+                              className="flex items-center gap-3 px-6 py-4 border border-white/10 text-white font-black uppercase tracking-tighter hover:bg-white/5 transition-colors"
+                            >
+                              <Share2 className="w-4 h-4" />
+                              Platform Fit
+                            </button>
                              <button
                                onClick={handleReset}
                                className="p-4 text-white/40 hover:text-red-500 transition-colors"
@@ -1929,6 +2018,19 @@ const App: React.FC = () => {
                       <p className="text-[10px] font-mono uppercase tracking-widest text-neon/70 text-center">
                         Clip health ready — {clipHealthReport.verdict}
                         {clipHealthReport.verdict !== 'OK' ? ` · ${clipHealthReport.summary}` : ' · motion in a healthy mid range'}.
+                      </p>
+                    )}
+
+                    {platformFitReport && (
+                      <p className="text-[10px] font-mono uppercase tracking-widest text-neon/70 text-center">
+                        Platform fit ready — {platformFitReport.aspect}
+                        {platformFitReport.durationSeconds != null ? ` · ${platformFitReport.durationSeconds.toFixed(1)}s` : ''}
+                        {' · '}
+                        {platformFitReport.platforms.filter((row) => row.status === 'GO').length} GO
+                        {' · '}
+                        {platformFitReport.platforms.filter((row) => row.status === 'WARN').length} WARN
+                        {' · '}
+                        {platformFitReport.platforms.filter((row) => row.status === 'NO-GO').length} NO-GO.
                       </p>
                     )}
 
@@ -1980,11 +2082,30 @@ const App: React.FC = () => {
                       />
                     )}
 
+                    {showPlatformFitPanel && (
+                      <PlatformFitPanel
+                        report={platformFitReport}
+                        busy={platformFitBusy}
+                        error={platformFitError}
+                        title={platformFitTitle}
+                        canGrade={Boolean((videoWidth && videoHeight) || frames.some((frame) => frame.imageUrl))}
+                        clipSummary={
+                          videoWidth && videoHeight
+                            ? `${videoWidth}×${videoHeight} · ${classifyAspect(videoWidth, videoHeight)}${videoDuration != null ? ` · ${videoDuration.toFixed(1)}s` : ''}`
+                            : 'Waiting for sampled clip size'
+                        }
+                        onTitleChange={setPlatformFitTitle}
+                        onGrade={handleGradePlatformFit}
+                        onClose={() => setShowPlatformFitPanel(false)}
+                      />
+                    )}
+
                     <p className="text-[10px] font-mono text-white/30 uppercase tracking-widest text-center leading-relaxed max-w-3xl mx-auto">
                       Footage Notes are a plain-text sidecar (header + timestamped shot notes) you can export next to the video
                       and import later so FrameFlow does not burn vision tokens on the same clip.
                       Rhythm Cue Map is a local Web Audio sidecar (inspired by BeatScope's cue-map idea, MIT; original FrameFlow implementation).
                       Clip Health / Motion Health is a local consecutive-frame luma-diff gate (inspired by AIVideoAdherenceGate, MIT; original FrameFlow implementation).
+                      Platform Fit grades GO / WARN / NO-GO from known duration + frame size (inspired by ShortsMCP, MIT; original FrameFlow implementation).
                     </p>
 
                     {showVerify && qualityReport && (

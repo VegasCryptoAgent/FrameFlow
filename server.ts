@@ -8,6 +8,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Readable } from "node:stream";
 import { scoreClipHealth } from "./utils/clipHealth";
+import { parsePlatformFitRequest } from "./utils/platformFit";
 
 const XAI_API_BASE_URL = 'https://api.x.ai/v1';
 const execFileAsync = promisify(execFile);
@@ -285,6 +286,18 @@ async function startServer() {
       return;
     }
     res.json(scoreClipHealth(body));
+  });
+
+  // Pure JSON platform-fit smoke path. No ffmpeg, no vision model, no extra keys.
+  // Platform-fit idea inspired by ShortsMCP (MIT); original FrameFlow implementation.
+  app.post("/api/platform-fit", (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const parsed = parsePlatformFitRequest(body);
+    if (parsed.ok === false) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    res.json(parsed.report);
   });
 
   // Helper for retries with jitter and more attempts for rate limits
