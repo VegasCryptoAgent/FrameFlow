@@ -1434,7 +1434,7 @@ const App: React.FC = () => {
     }
     applySilenceMap(
       parsed.map,
-      `Imported silence map (${parsed.map.silences.length} gaps · ${parsed.map.talkWindows.length} talk windows).`
+      `Imported silence map (${parsed.map.silences.length} gap${parsed.map.silences.length === 1 ? '' : 's'} · ${parsed.map.talkWindows.length} talk window${parsed.map.talkWindows.length === 1 ? '' : 's'}).`
     );
   };
 
