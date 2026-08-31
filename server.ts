@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { Readable } from "node:stream";
 import { scoreClipHealth } from "./utils/clipHealth";
 import { parsePlatformFitRequest } from "./utils/platformFit";
+import { apiFromScore, parseSilenceMapRequest } from "./utils/silenceMap";
 
 const XAI_API_BASE_URL = 'https://api.x.ai/v1';
 const execFileAsync = promisify(execFile);
@@ -298,6 +299,18 @@ async function startServer() {
       return;
     }
     res.json(parsed.report);
+  });
+
+  // Pure JSON silence / talk-gap smoke path. No ffmpeg, no media decode, no extra keys.
+  // Inspired by misbakhul29/clipper, original FrameFlow implementation.
+  app.post("/api/silence-map", (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const parsed = parseSilenceMapRequest(body);
+    if (parsed.ok === false) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    res.json(apiFromScore(parsed.score));
   });
 
   // Helper for retries with jitter and more attempts for rate limits

@@ -29,7 +29,8 @@ import {
   Upload,
   AudioLines,
   HeartPulse,
-  Share2
+  Share2,
+  Scissors
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -41,6 +42,7 @@ import FootageNotesPanel from './components/FootageNotesPanel';
 import RhythmCuePanel from './components/RhythmCuePanel';
 import ClipHealthPanel from './components/ClipHealthPanel';
 import PlatformFitPanel from './components/PlatformFitPanel';
+import SilenceMapPanel from './components/SilenceMapPanel';
 import { extractFramesFromVideo } from './utils/videoProcessor';
 import {
   analyzeVideoRhythm,
@@ -58,6 +60,17 @@ import {
   serializeClipHealthReport,
 } from './utils/clipHealth';
 import { classifyAspect, postPlatformFit } from './utils/platformFit';
+import {
+  applyTalkWindowPreference,
+  buildSilenceMap,
+  mapFromApi,
+  parseSilenceMap,
+  postSilenceMap,
+  sampleVideoRms,
+  scoreSilenceSamples,
+  serializeSilenceMap,
+  silenceSidecarDownloadName,
+} from './utils/silenceMap';
 import {
   buildProductionPacket,
   downloadTextFile,
@@ -87,7 +100,7 @@ import {
   refineRemix,
   checkXaiConfiguration
 } from './services/xaiService';
-import { FrameData, AnalysisStatus, AppSettings, type ClipHealthReport, type PlatformFitReport, type RhythmMap } from './types';
+import { FrameData, AnalysisStatus, AppSettings, type ClipHealthReport, type PlatformFitReport, type RhythmMap, type SilenceMap } from './types';
 
 // Simple ID generator
 const generateId = () => Math.random().toString(36).substring(2, 9);
@@ -179,6 +192,14 @@ const App: React.FC = () => {
   const [platformFitTitle, setPlatformFitTitle] = useState('');
   const [platformFitBusy, setPlatformFitBusy] = useState(false);
   const [platformFitError, setPlatformFitError] = useState<string | null>(null);
+  const [silenceMap, setSilenceMap] = useState<SilenceMap | null>(null);
+  const [showSilencePanel, setShowSilencePanel] = useState(false);
+  const [silenceDraft, setSilenceDraft] = useState('');
+  const [silenceBusy, setSilenceBusy] = useState(false);
+  const [silenceError, setSilenceError] = useState<string | null>(null);
+  const [silenceNoiseFloor, setSilenceNoiseFloor] = useState(0);
+  const [silenceMinGapSec, setSilenceMinGapSec] = useState(0.45);
+  const [silenceMinTalkSec, setSilenceMinTalkSec] = useState(0.3);
   const noticeTimerRef = useRef<number | null>(null);
   const cdafFileInputRef = useRef<HTMLInputElement>(null);
 
@@ -245,6 +266,7 @@ const App: React.FC = () => {
     customInstructions: '',
     promptTemplate: '{{PROMPT}}', // Default template
     preferBeatAccents: false,
+    preferTalkWindows: false,
   });
   const [showSettings, setShowSettings] = useState(false);
 
@@ -312,6 +334,10 @@ const App: React.FC = () => {
     setPlatformFitTitle('');
     setShowPlatformFitPanel(false);
     setPlatformFitError(null);
+    setSilenceMap(null);
+    setSilenceDraft('');
+    setShowSilencePanel(false);
+    setSilenceError(null);
     setVideoSha256(undefined);
     setVideoDuration(undefined);
     setVideoWidth(undefined);
@@ -367,6 +393,10 @@ const App: React.FC = () => {
     setPlatformFitTitle('');
     setShowPlatformFitPanel(false);
     setPlatformFitError(null);
+    setSilenceMap(null);
+    setSilenceDraft('');
+    setShowSilencePanel(false);
+    setSilenceError(null);
     setVideoName('');
     setVideoSha256(undefined);
     setVideoDuration(undefined);
@@ -389,15 +419,26 @@ const App: React.FC = () => {
     setShowVerify(false);
 
     try {
-      const durationForSampling = videoDuration ?? rhythmMap?.duration ?? 0;
-      const sampleTimes = computeSampleTimestamps(
+      const durationForSampling = videoDuration ?? rhythmMap?.duration ?? silenceMap?.duration ?? 0;
+      const beatTimes = computeSampleTimestamps(
         durationForSampling,
         settings.samplingInterval,
         rhythmMap,
         settings.preferBeatAccents
       );
-      const useBeatTimes = Boolean(
-        settings.preferBeatAccents && rhythmMap && sampleTimes.length > 0 && durationForSampling > 0
+      const sampleTimes = applyTalkWindowPreference(
+        beatTimes,
+        durationForSampling,
+        silenceMap,
+        settings.preferTalkWindows
+      );
+      const useAccentTimes = Boolean(
+        sampleTimes.length > 0
+        && durationForSampling > 0
+        && (
+          (settings.preferBeatAccents && rhythmMap)
+          || (settings.preferTalkWindows && silenceMap)
+        )
       );
 
       // 1. Extract Frames
@@ -405,7 +446,7 @@ const App: React.FC = () => {
         videoUrl, 
         settings.samplingInterval,
         (prog) => setProgress(prog),
-        useBeatTimes ? { timestamps: sampleTimes } : undefined
+        useAccentTimes ? { timestamps: sampleTimes } : undefined
       );
 
       if (extractedFrames.length === 0) {
@@ -1306,6 +1347,111 @@ const App: React.FC = () => {
     }
   };
 
+  const applySilenceMap = (map: SilenceMap, notice: string) => {
+    setSilenceMap(map);
+    setSilenceDraft(serializeSilenceMap(map));
+    setSilenceError(null);
+    showNotice(notice);
+  };
+
+  const handleAnalyzeSilence = async () => {
+    if (!videoUrl && !videoFile) {
+      showNotice('Load a video before analyzing silence.');
+      return;
+    }
+    setSilenceBusy(true);
+    setSilenceError(null);
+    try {
+      const source = videoFile || videoUrl;
+      if (!source) throw new Error('Load a video before analyzing silence.');
+      const local = await sampleVideoRms(source);
+      const duration = videoDuration && videoDuration > 0 ? videoDuration : local.duration;
+      const controls = {
+        noiseFloor: silenceNoiseFloor > 0 ? silenceNoiseFloor : undefined,
+        minSilenceSec: silenceMinGapSec,
+        minTalkSec: silenceMinTalkSec,
+      };
+      const fallback = buildSilenceMap(
+        scoreSilenceSamples(local.samples, duration, controls),
+        { video: videoName || undefined }
+      );
+      let api;
+      try {
+        api = await postSilenceMap({
+          durationSeconds: duration,
+          samples: local.samples,
+          ...controls,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Silence map API failed.';
+        setSilenceError(message);
+        applySilenceMap(
+          fallback,
+          `${fallback.summary} (local fallback)`
+        );
+        return;
+      }
+      const map = mapFromApi(api, {
+        samples: local.samples,
+        duration,
+        noiseFloor: fallback.noiseFloor,
+        minSilenceSec: fallback.minSilenceSec,
+        minTalkSec: fallback.minTalkSec,
+        video: videoName || undefined,
+      });
+      applySilenceMap(
+        map,
+        `Silence map ready — ${map.silences.length} gap${map.silences.length === 1 ? '' : 's'} · ${map.talkWindows.length} talk window${map.talkWindows.length === 1 ? '' : 's'}.`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Silence analysis failed.';
+      setSilenceError(message);
+      showNotice(message);
+    } finally {
+      setSilenceBusy(false);
+    }
+  };
+
+  const handleExportSilenceMap = () => {
+    if (!silenceMap) {
+      showNotice('Analyze or import a silence map before exporting.');
+      return;
+    }
+    downloadTextFile(
+      silenceSidecarDownloadName(silenceMap.video || videoName || 'footage'),
+      serializeSilenceMap(silenceMap),
+      'application/json'
+    );
+    showNotice(`Exported ${silenceSidecarDownloadName(silenceMap.video || videoName || 'footage')}.`);
+  };
+
+  const applyImportedSilence = (text: string) => {
+    const parsed = parseSilenceMap(text);
+    if (parsed.ok === false) {
+      setSilenceError(parsed.error);
+      showNotice(parsed.error);
+      return;
+    }
+    applySilenceMap(
+      parsed.map,
+      `Imported silence map (${parsed.map.silences.length} gaps · ${parsed.map.talkWindows.length} talk windows).`
+    );
+  };
+
+  const handleSilenceFile = async (file: File) => {
+    setSilenceBusy(true);
+    try {
+      const text = await file.text();
+      setSilenceDraft(text);
+      applyImportedSilence(text);
+    } catch {
+      setSilenceError('Could not read that silence map file.');
+      showNotice('Could not read that silence map file.');
+    } finally {
+      setSilenceBusy(false);
+    }
+  };
+
   const handleLockPassport = () => {
     const packet = runVerifyPass(frames);
     const block = packet.passport.lockedBlock;
@@ -1655,6 +1801,17 @@ const App: React.FC = () => {
                               Prefer beat accents when sampling
                             </span>
                           </label>
+                          <label className="flex items-center gap-3 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={settings.preferTalkWindows}
+                              onChange={(e) => setSettings({ ...settings, preferTalkWindows: e.target.checked })}
+                              className="accent-neon w-4 h-4"
+                            />
+                            <span className="text-[10px] font-black uppercase tracking-widest text-white/60">
+                              Prefer talk windows when sampling
+                            </span>
+                          </label>
                         </div>
 
                         <div className="space-y-4">
@@ -1891,6 +2048,12 @@ const App: React.FC = () => {
                               <Share2 className="w-4 h-4" /> Platform Fit
                             </button>
                             <button
+                              onClick={() => setShowSilencePanel((open) => !open)}
+                              className="flex items-center gap-2 px-5 py-4 border border-white/10 text-white font-black uppercase tracking-tighter hover:bg-white/5 transition-colors"
+                            >
+                              <Scissors className="w-4 h-4" /> Silence Map
+                            </button>
+                            <button
                               onClick={handleReset}
                               className="p-4 text-white/40 hover:text-red-500 transition-colors border border-white/10 hover:border-red-500/30"
                               title="Clear video and go back"
@@ -1988,6 +2151,14 @@ const App: React.FC = () => {
                               <Share2 className="w-4 h-4" />
                               Platform Fit
                             </button>
+                            <button
+                              id="silence-map-control-tools"
+                              onClick={() => setShowSilencePanel((open) => !open)}
+                              className="flex items-center gap-3 px-6 py-4 border border-white/10 text-white font-black uppercase tracking-tighter hover:bg-white/5 transition-colors"
+                            >
+                              <Scissors className="w-4 h-4" />
+                              Silence Map
+                            </button>
                              <button
                                onClick={handleReset}
                                className="p-4 text-white/40 hover:text-red-500 transition-colors"
@@ -2031,6 +2202,16 @@ const App: React.FC = () => {
                         {platformFitReport.platforms.filter((row) => row.status === 'WARN').length} WARN
                         {' · '}
                         {platformFitReport.platforms.filter((row) => row.status === 'NO-GO').length} NO-GO.
+                      </p>
+                    )}
+
+                    {silenceMap && (
+                      <p className="text-[10px] font-mono uppercase tracking-widest text-neon/70 text-center">
+                        Silence map ready — {silenceMap.silences.length} gap{silenceMap.silences.length === 1 ? '' : 's'}
+                        {' · '}
+                        {silenceMap.talkWindows.length} talk window{silenceMap.talkWindows.length === 1 ? '' : 's'}
+                        {silenceMap.suggestedCuts.length ? ` · ${silenceMap.suggestedCuts.length} suggested cuts` : ''}
+                        {settings.preferTalkWindows ? ' · talk-window sampling on' : ''}.
                       </p>
                     )}
 
@@ -2100,12 +2281,37 @@ const App: React.FC = () => {
                       />
                     )}
 
+                    {showSilencePanel && (
+                      <SilenceMapPanel
+                        map={silenceMap}
+                        busy={silenceBusy}
+                        error={silenceError}
+                        draft={silenceDraft}
+                        canAnalyze={Boolean(videoUrl || videoFile)}
+                        preferTalkWindows={settings.preferTalkWindows}
+                        noiseFloor={silenceNoiseFloor}
+                        minSilenceSec={silenceMinGapSec}
+                        minTalkSec={silenceMinTalkSec}
+                        onDraftChange={setSilenceDraft}
+                        onPreferTalkWindows={(value) => setSettings({ ...settings, preferTalkWindows: value })}
+                        onNoiseFloorChange={setSilenceNoiseFloor}
+                        onMinSilenceSecChange={setSilenceMinGapSec}
+                        onMinTalkSecChange={setSilenceMinTalkSec}
+                        onAnalyze={handleAnalyzeSilence}
+                        onExport={handleExportSilenceMap}
+                        onImportFile={handleSilenceFile}
+                        onApplyImport={() => applyImportedSilence(silenceDraft)}
+                        onClose={() => setShowSilencePanel(false)}
+                      />
+                    )}
+
                     <p className="text-[10px] font-mono text-white/30 uppercase tracking-widest text-center leading-relaxed max-w-3xl mx-auto">
                       Footage Notes are a plain-text sidecar (header + timestamped shot notes) you can export next to the video
                       and import later so FrameFlow does not burn vision tokens on the same clip.
                       Rhythm Cue Map is a local Web Audio sidecar (inspired by BeatScope's cue-map idea, MIT; original FrameFlow implementation).
                       Clip Health / Motion Health is a local consecutive-frame luma-diff gate (inspired by AIVideoAdherenceGate, MIT; original FrameFlow implementation).
                       Platform Fit grades GO / WARN / NO-GO from known duration + frame size (inspired by ShortsMCP, MIT; original FrameFlow implementation).
+                      Silence Cut Map scores browser RMS hops into talk windows and suggested trims (inspired by misbakhul29/clipper, original FrameFlow implementation).
                     </p>
 
                     {showVerify && qualityReport && (

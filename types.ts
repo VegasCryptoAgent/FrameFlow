@@ -51,6 +51,7 @@ export interface AppSettings {
   customInstructions: string;
   promptTemplate: string; // Template with placeholders like {{PROMPT}}
   preferBeatAccents: boolean;
+  preferTalkWindows: boolean;
 }
 
 export const RHYTHM_MAP_SCHEMA_VERSION = 'frameflow-rhythm-map-1.0' as const;
@@ -190,4 +191,62 @@ export interface ClipHealthReport {
   timestamps: number[];
   samples: ClipHealthSample[];
   issues: ClipHealthIssue[];
+}
+
+export const SILENCE_MAP_SCHEMA_VERSION = 'frameflow-silence-map-1.0' as const;
+
+export const SILENCE_MAP_ATTRIBUTION =
+  'inspired by misbakhul29/clipper, original FrameFlow implementation';
+
+/** RMS hop from the browser Web Audio decoder. Server never reads the media file. */
+export interface SilenceSample {
+  t: number;
+  rms: number;
+}
+
+export interface SilenceGap {
+  start: number;
+  end: number;
+  duration: number;
+  meanRms: number;
+}
+
+export interface TalkWindow {
+  start: number;
+  end: number;
+  duration: number;
+  meanRms: number;
+}
+
+/** Suggested trim — a map, not a rendered cut. FrameFlow does not burn or reframe video. */
+export type SuggestedCutKind = 'drop_leading_silence' | 'drop_trailing_silence' | 'drop_internal_gap';
+
+export interface SuggestedCut {
+  kind: SuggestedCutKind;
+  start: number;
+  end: number;
+  reason: string;
+}
+
+/**
+ * Versioned silence / talk-gap sidecar from browser RMS hops.
+ * schema_version: frameflow-silence-map-1.0
+ *
+ * Inspired by misbakhul29/clipper (MIT idea: silence → talk segments / suggested cuts);
+ * original FrameFlow implementation. Not their Go/ffmpeg pipeline.
+ */
+export interface SilenceMap {
+  schema_version: typeof SILENCE_MAP_SCHEMA_VERSION;
+  attribution: string;
+  duration: number;
+  noiseFloor: number;
+  minSilenceSec: number;
+  minTalkSec: number;
+  samples: SilenceSample[];
+  silences: SilenceGap[];
+  talkWindows: TalkWindow[];
+  suggestedCuts: SuggestedCut[];
+  summary: string;
+  video?: string;
+  created?: string;
 }

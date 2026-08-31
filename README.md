@@ -99,3 +99,13 @@ After frames are sampled, **Clip Health** (next to Rhythm Map / Verify / Export 
 - `POST /api/clip-health` accepts `{ samples: [{ timestamp, motion }, ...] }` or `{ diffs: number[] }` and returns `{ ok, verdict, mean, variance, issues, summary }`. Pure JSON — no ffmpeg. `GET /api/health` is unchanged.
 
 Motion-health idea inspired by AIVideoAdherenceGate (MIT); original FrameFlow implementation. Not a clone of that project's Python CLI or source.
+
+## Silence cut map
+
+After a video is loaded, **Silence Map** (same extra-tools rail as Rhythm Map / Clip Health / Platform Fit) turns browser Web Audio RMS hops into silence gaps, talk windows, and suggested trims — no ffmpeg, no burn-in, no extra API keys.
+
+- **Analyze Silence** decodes the loaded clip in the browser, samples RMS, then `POST /api/silence-map` scores `{ durationSeconds, samples: [{ t, rms }], noiseFloor?, minSilenceSec?, minTalkSec? }` into `{ ok, source, silences[], talkWindows[], suggestedCuts[], summary }`. The server never decodes video. Controls set the RMS / noise threshold and minimum gap (and talk) seconds. Floor `0` means auto.
+- **Export** downloads a versioned `.ffsilence.json` sidecar (`frameflow-silence-map-1.0`). **Import** (upload or paste) reloads it.
+- **Prefer talk windows when sampling** (Config or the silence panel) snaps Deconstruct's frame times into talk windows when a map is present — parallel to beat-accent sampling. The existing interval remains the fallback.
+
+Inspired by misbakhul29/clipper, original FrameFlow implementation. Not a clone of that project's Go/ffmpeg filtergraphs, ASS burn pipeline, or OpenRouter prompts.
